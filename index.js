@@ -104,4 +104,76 @@ async function startBot() {
   });
 
   sock.ev.on('messages.upsert', async (m) => {
-    const
+    const msg = m.messages[0];
+    if (!msg.message || msg.key.fromMe) return;
+
+    const sender = msg.key.remoteJid;
+    if (sender.endsWith('@g.us')) return; 
+
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
+
+    if (text) {
+      console.log(`DM from ${sender}: ${text}`);
+      await sock.sendPresenceUpdate('composing', sender);
+      const reply = await getAIResponse(text);
+      await sock.sendPresenceUpdate('paused', sender);
+      await sock.sendMessage(sender, { text: reply });
+    }
+  });
+}
+
+// Web Dashboard
+app.get('/', async (req, res) => {
+  if (connectionStatus === 'Connected') {
+    res.send(`
+      <html>
+        <head><title>Webbiewooble AI Agent</title><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 30px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); } h1 { color: #075e54; }</style></head>
+        <body>
+          <div class="card">
+            <h1>Webbiewooble AI Agent is Online!</h1>
+            <p>Status: <strong>Connected</strong></p>
+            <p>The bot is active and replying to personal messages on WhatsApp.</p>
+          </div>
+        </body>
+      </html>
+    `);
+  } else if (pairingCode) {
+    res.send(`
+      <html>
+        <head><title>Pairing Code - Webbiewooble</title><meta http-equiv="refresh" content="15"><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 35px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); } .code { font-size: 34px; font-weight: bold; letter-spacing: 4px; color: #128c7e; background-color: #e3f2fd; padding: 15px 25px; border-radius: 5px; margin: 20px 0; display: inline-block; font-family: monospace; } h1 { color: #128c7e; }</style></head>
+        <body>
+          <div class="card">
+            <h1>Link Your Webbiewooble Bot</h1>
+            <p>Status: <strong>${connectionStatus}</strong></p>
+            <p>Enter this code on your WhatsApp mobile app:</p>
+            <div class="code">${pairingCode}</div>
+            <p style="color: #666;"><small>To link, open WhatsApp on your phone:<br><strong>Settings</strong> → <strong>Linked Devices</strong> → <strong>Link a Device</strong> → <strong>Link with phone number instead</strong></small></p>
+            <p><small>This page auto-refreshes. Once successfully linked, the status changes to Online.</small></p>
+          </div>
+        </body>
+      </html>
+    `);
+  } else {
+    res.send(`
+      <html>
+        <head><title>Initializing...</title><meta http-equiv="refresh" content="5"><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 30px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); } .error-msg { color: #d32f2f; font-weight: bold; }</style></head>
+        <body>
+          <div class="card">
+            <h1>Initializing Bot Session...</h1>
+            <p>Status: <span class="${connectionStatus.includes('Error') ? 'error-msg' : ''}"><strong>${connectionStatus}</strong></span></p>
+            ${connectionStatus.includes('Error') ? 
+              '<p>Please configure the <code>PHONE_NUMBER</code> variable inside your Railway Dashboard, then rebuild the service.</p>' : 
+              '<p>Requesting fresh, active pairing code. Please wait a few seconds...</p>'
+            }
+          </div>
+        </body>
+      </html>
+    `);
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Web server successfully running on port ${port}`);
+});
+
+startBot();
