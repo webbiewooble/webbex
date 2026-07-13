@@ -1,4 +1,4 @@
-// System Instruction defining your agency, pricing, and behavioral guidelines
+// System Instruction defining your agency, pricing, portfolio links, and behavioral guidelines
 const SYSTEM_PROMPT = `You are a very kind, polite, warm, and helpful AI sales agent for "Webbiewooble", a professional website-providing agency. Your goal is to guide potential clients and help them choose the perfect website package for their needs.
 
 Here is the key information about Webbiewooble's offerings:
@@ -17,6 +17,16 @@ Here is the key information about Webbiewooble's offerings:
    - Advantages: Shopify is much smoother, more reliable, and significantly easier to use than WordPress.
    - Note: Client must pay for their own Shopify subscription/hosting plan.
 
+4. Portfolio, Samples, and Live Demos:
+   Whenever a client asks to see "samples," "past work," "demos," "portfolio," or "examples of what we have built," kindly and enthusiastically present these exact links:
+   * Our Main Agency Portfolio & Resume: 
+     https://webbiewooble.github.io/Tanush-Talwar-resume-portfolio/ (A deep look into our capabilities and development skills)
+   * Live E-commerce Client Websites (Shopify / WordPress):
+     - https://the9amcompany.com/
+     - https://evoracare.in/
+   * Live Law Firm / Lawyer Website:
+     - https://lawionandpartners.com/
+
 Behavior Rules:
 - Always be exceptionally kind, friendly, and welcoming. Use polite greetings.
 - Keep responses easy to read on WhatsApp. Use clear spacing and bullet points.
@@ -28,11 +38,11 @@ async function callGroq(prompt) {
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${process.env.GROQ_API_KEY?.trim()}`, // Trim spaces
+      'Authorization': `Bearer ${process.env.GROQ_API_KEY?.trim()}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      model: 'llama-3.1-8b-instant', // Upgraded to a modern, stable stable model
+      model: 'llama-3.1-8b-instant',
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: prompt }
@@ -52,7 +62,7 @@ async function callGroq(prompt) {
 // Helper for Gemini API
 async function callGemini(prompt) {
   const formattedPrompt = `${SYSTEM_PROMPT}\n\nClient message: ${prompt}`;
-  const apiKey = process.env.GEMINI_API_KEY?.trim(); // Trim spaces
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
   
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
     method: 'POST',
@@ -78,7 +88,7 @@ async function callOpenRouter(prompt) {
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY?.trim()}`, // Trim spaces
+      'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY?.trim()}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
@@ -101,9 +111,7 @@ async function callOpenRouter(prompt) {
 
 // Main AI Handler with dynamic case-insensitive primary configuration
 async function getAIResponse(prompt) {
-  // Convert PRIMARY_AI to lowercase to avoid case-sensitivity bugs (e.g., 'Groq' vs 'groq')
   const primary = (process.env.PRIMARY_AI || 'groq').toLowerCase();
-  
   const order = [primary, 'groq', 'gemini', 'openrouter'].filter((v, i, a) => a.indexOf(v) === i);
 
   for (const provider of order) {
@@ -121,7 +129,6 @@ async function getAIResponse(prompt) {
         return await callOpenRouter(prompt);
       }
     } catch (error) {
-      // This will log the EXACT HTTP error reason returned by the AI provider to your console!
       console.error(`Provider [${provider}] failed:`, error.message);
     }
   }
