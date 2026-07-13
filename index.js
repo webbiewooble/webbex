@@ -11,7 +11,6 @@ let qrCodeData = null;
 let connectionStatus = 'Disconnected';
 
 async function startBot() {
-  // Saved session states are saved to 'auth_info_baileys' directory.
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
   const sock = makeWASocket({
@@ -37,7 +36,7 @@ async function startBot() {
     } else if (connection === 'open') {
       console.log('Connected to WhatsApp successfully!');
       connectionStatus = 'Connected';
-      qrCodeData = null; // Clear QR data on successful link
+      qrCodeData = null;
     }
   });
 
@@ -46,12 +45,20 @@ async function startBot() {
     if (!msg.message || msg.key.fromMe) return;
 
     const sender = msg.key.remoteJid;
+
+    // RULE: Do not respond in groups. 
+    // In WhatsApp, individual numbers end with '@s.whatsapp.net', while group chats end with '@g.us'.
+    if (sender.endsWith('@g.us')) {
+      console.log(`Message from group ${sender} ignored.`);
+      return; 
+    }
+
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
 
     if (text) {
-      console.log(`Message from ${sender}: ${text}`);
+      console.log(`DM from ${sender}: ${text}`);
       
-      // Simulate typing for natural behavior
+      // Simulate typing state in the chat
       await sock.sendPresenceUpdate('composing', sender);
       
       const reply = await getAIResponse(text);
@@ -62,17 +69,17 @@ async function startBot() {
   });
 }
 
-// Simple web UI to render the QR Code or display Connection status
+// Web Dashboard routes to scan QR or display bot online status
 app.get('/', async (req, res) => {
   if (connectionStatus === 'Connected') {
     res.send(`
       <html>
-        <head><title>Bot Status</title><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 30px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); } h1 { color: #075e54; }</style></head>
+        <head><title>Webbiewooble AI Agent</title><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 30px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); } h1 { color: #075e54; }</style></head>
         <body>
           <div class="card">
-            <h1>WhatsApp Bot is Online!</h1>
+            <h1>Webbiewooble AI Agent is Online!</h1>
             <p>Status: <strong>Connected</strong></p>
-            <p>The bot is active and replying to chats.</p>
+            <p>The bot is active and replying to personal messages on WhatsApp.</p>
           </div>
         </body>
       </html>
@@ -82,14 +89,14 @@ app.get('/', async (req, res) => {
       const qrImage = await qrcode.toDataURL(qrCodeData);
       res.send(`
         <html>
-          <head><title>Scan QR</title><meta http-equiv="refresh" content="15"><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 30px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); } img { border: 1px solid #ccc; padding: 10px; border-radius: 5px; margin-top: 15px; } h1 { color: #128c7e; }</style></head>
+          <head><title>Scan QR - Webbiewooble</title><meta http-equiv="refresh" content="15"><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 30px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); } img { border: 1px solid #ccc; padding: 10px; border-radius: 5px; margin-top: 15px; } h1 { color: #128c7e; }</style></head>
           <body>
             <div class="card">
-              <h1>Link Your Bot</h1>
+              <h1>Link Your Webbiewooble Bot</h1>
               <p>Status: <strong>${connectionStatus}</strong></p>
               <p>Scan this QR code with WhatsApp Link Devices:</p>
               <img src="${qrImage}" alt="QR Code" />
-              <p><small>This page auto-refreshes every 15 seconds as the QR code updates.</small></p>
+              <p><small>This page auto-refreshes every 15 seconds to fetch updated code.</small></p>
             </div>
           </body>
         </html>
