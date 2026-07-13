@@ -1,5 +1,6 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+// Added fetchLatestBaileysVersion to bypass protocol rejects
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
@@ -18,7 +19,7 @@ function clearSessionDirectory() {
   if (fs.existsSync(dir)) {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
-      console.log('✓ Cleared corrupt/logged-out session directory successfully.');
+      console.log('✓ Cleared corrupt session directory.');
     } catch (err) {
       console.error('Failed to clear session directory:', err);
     }
@@ -28,11 +29,23 @@ function clearSessionDirectory() {
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
+  // 1. Fetch latest WhatsApp Web version to prevent HTTP 405 Method Not Allowed
+  let waVersion = [2, 3000, 1015978187]; // Safe hardcoded fallback version
+  try {
+    const fetched = await fetchLatestBaileysVersion();
+    if (fetched && fetched.version) {
+      waVersion = fetched.version;
+      console.log(`Using fetched WhatsApp Web version: ${waVersion.join('.')}`);
+    }
+  } catch (err) {
+    console.warn('Could not fetch latest WA version, using secure fallback:', err.message);
+  }
+
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false, // Turn off terminal QR so it uses pairing code instead
+    version: waVersion, // Forces the socket to use the latest version
+    printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    // Use standard desktop browser values for secure authentication
     browser: ['Mac OS', 'Chrome', '10.1.10'] 
   });
 
@@ -41,12 +54,10 @@ async function startBot() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     
-    // Generate pairing code when a connection prompt (QR) is received
     if (qr && !sock.authState.creds.registered && process.env.PHONE_NUMBER && !pairingCodeRequested) {
       pairingCodeRequested = true;
       connectionStatus = 'Generating Pairing Code...';
       try {
-        // Strip plus signs, spaces, or dashes to format as clean E.164
         const cleanNumber = process.env.PHONE_NUMBER.replace(/[^0-9]/g, '');
         console.log(`Requesting pairing code for: ${cleanNumber}`);
         
@@ -54,9 +65,7 @@ async function startBot() {
         pairingCode = code;
         connectionStatus = 'Pairing Code Ready';
         
-        console.log(`\n=========================================\n`);
-        console.log(`YOUR WHATSAPP PAIRING CODE: ${code}`);
-        console.log(`\n=========================================\n`);
+        console.log(`\n=========================================\nYOUR WHATSAPP PAIRING CODE: ${code}\n=========================================\n`);
       } catch (err) {
         console.error('Failed to request pairing code:', err);
         connectionStatus = 'Pairing Request Failed';
@@ -72,7 +81,6 @@ async function startBot() {
       pairingCodeRequested = false;
 
       if (reason === DisconnectReason.badSession || reason === DisconnectReason.loggedOut) {
-        console.log('Bad session or user logged out. Wiping credentials...');
         clearSessionDirectory();
         connectionStatus = 'Logged Out (Resetting...)';
       } else {
@@ -100,8 +108,6 @@ async function startBot() {
     if (!msg.message || msg.key.fromMe) return;
 
     const sender = msg.key.remoteJid;
-
-    // Do not respond in groups
     if (sender.endsWith('@g.us')) return; 
 
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
