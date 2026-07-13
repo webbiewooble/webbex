@@ -1,13 +1,14 @@
 const express = require('express');
-// Added fetchLatestBaileysVersion to bypass protocol rejects
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+// Switched to fetchLatestWaWebVersion for correct, up-to-date protocol checks
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
 const { getAIResponse } = require('./ai');
 
 const app = express();
-const port = process.env.PORT || 3000;
+// Explicitly default to port 8080 for Webbex in Railway
+const port = process.env.PORT || 8080;
 
 let pairingCode = null;
 let connectionStatus = 'Disconnected';
@@ -29,24 +30,35 @@ function clearSessionDirectory() {
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
-  // 1. Fetch latest WhatsApp Web version to prevent HTTP 405 Method Not Allowed
-  let waVersion = [2, 3000, 1015978187]; // Safe hardcoded fallback version
+  // Verify if PHONE_NUMBER variable exists in Railway
+  if (!process.env.PHONE_NUMBER) {
+    connectionStatus = 'Error: PHONE_NUMBER variable missing in Railway Dashboard!';
+    console.error('==================================================');
+    console.error('CRITICAL ERROR: PHONE_NUMBER is not set in Railway variables!');
+    console.error('Please add PHONE_NUMBER with your number (e.g., 919318399511)');
+    console.error('==================================================');
+    return;
+  }
+
+  // Fetch the actual current WhatsApp Web version to prevent handshake rejection
+  let waVersion = [2, 3000, 1042466098]; // Reliable fallback version
   try {
-    const fetched = await fetchLatestBaileysVersion();
+    const fetched = await fetchLatestWaWebVersion();
     if (fetched && fetched.version) {
       waVersion = fetched.version;
-      console.log(`Using fetched WhatsApp Web version: ${waVersion.join('.')}`);
+      console.log(`Successfully fetched latest WhatsApp Web version: ${waVersion.join('.')}`);
     }
   } catch (err) {
-    console.warn('Could not fetch latest WA version, using secure fallback:', err.message);
+    console.warn('Could not fetch latest WA version dynamically, using stable fallback:', err.message);
   }
 
   const sock = makeWASocket({
     auth: state,
-    version: waVersion, // Forces the socket to use the latest version
+    version: waVersion, // Force modern protocol connection
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: ['Mac OS', 'Chrome', '10.1.10'] 
+    // Explicit standard browser footprint required for secure pairing
+    browser: ['Ubuntu', 'Chrome', '20.0.04'] 
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -54,18 +66,21 @@ async function startBot() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     
+    // Request pairing code when QR signature event triggers
     if (qr && !sock.authState.creds.registered && process.env.PHONE_NUMBER && !pairingCodeRequested) {
       pairingCodeRequested = true;
       connectionStatus = 'Generating Pairing Code...';
       try {
         const cleanNumber = process.env.PHONE_NUMBER.replace(/[^0-9]/g, '');
-        console.log(`Requesting pairing code for: ${cleanNumber}`);
+        console.log(`Requesting pairing code for clean number: ${cleanNumber}`);
         
         const code = await sock.requestPairingCode(cleanNumber);
         pairingCode = code;
         connectionStatus = 'Pairing Code Ready';
         
-        console.log(`\n=========================================\nYOUR WHATSAPP PAIRING CODE: ${code}\n=========================================\n`);
+        console.log(`\n=========================================\n`);
+        console.log(`YOUR WHATSAPP PAIRING CODE: ${code}`);
+        console.log(`\n=========================================\n`);
       } catch (err) {
         console.error('Failed to request pairing code:', err);
         connectionStatus = 'Pairing Request Failed';
@@ -122,7 +137,7 @@ async function startBot() {
   });
 }
 
-// Web UI Dashboard
+// Web Dashboard
 app.get('/', async (req, res) => {
   if (connectionStatus === 'Connected') {
     res.send(`
@@ -156,12 +171,15 @@ app.get('/', async (req, res) => {
   } else {
     res.send(`
       <html>
-        <head><title>Initializing...</title><meta http-equiv="refresh" content="5"><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 30px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }</style></head>
+        <head><title>Initializing...</title><meta http-equiv="refresh" content="5"><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 30px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); } .error-msg { color: #d32f2f; font-weight: bold; }</style></head>
         <body>
           <div class="card">
             <h1>Initializing Bot Session...</h1>
-            <p>Status: <strong>${connectionStatus}</strong></p>
-            <p>Preparing to request your pairing code. Please wait a few seconds...</p>
+            <p>Status: <span class="${connectionStatus.includes('Error') ? 'error-msg' : ''}"><strong>${connectionStatus}</strong></span></p>
+            ${connectionStatus.includes('Error') ? 
+              '<p>Please configure the <code>PHONE_NUMBER</code> variable inside your Railway Dashboard, then rebuild the service.</p>' : 
+              '<p>Requesting secure handshake version and pairing code. Please wait a few seconds...</p>'
+            }
           </div>
         </body>
       </html>
@@ -170,7 +188,7 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Web server running on port ${port}`);
+  console.log(`Web server successfully running on port ${port}`);
 });
 
 startBot();
