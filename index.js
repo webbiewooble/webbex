@@ -2,6 +2,8 @@ const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
 const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
 const { getAIResponse } = require('./ai');
 
 const app = express();
@@ -9,6 +11,20 @@ const port = process.env.PORT || 3000;
 
 let qrCodeData = null;
 let connectionStatus = 'Disconnected';
+let isReconnecting = false;
+
+// Helper function to automatically wipe corrupted auth files
+function clearSessionDirectory() {
+  const dir = path.join(__dirname, 'auth_info_baileys');
+  if (fs.existsSync(dir)) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      console.log('✓ Cleared corrupt/logged-out session directory successfully.');
+    } catch (err) {
+      console.error('Failed to clear session directory:', err);
+    }
+  }
+}
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -16,7 +32,9 @@ async function startBot() {
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: true,
-    logger: pino({ level: 'silent' })
+    logger: pino({ level: 'silent' }),
+    // Emulates standard desktop Google Chrome to bypass instant rejections
+    browser: ['Mac OS', 'Chrome', '10.1.10'] 
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -25,14 +43,36 @@ async function startBot() {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       qrCodeData = qr;
+      connectionStatus = 'Waiting for Scan';
     }
+    
     if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('Connection closed. Reconnecting...', shouldReconnect);
-      connectionStatus = 'Disconnected (Reconnecting...)';
-      if (shouldReconnect) {
-        startBot();
+      const reason = lastDisconnect?.error?.output?.statusCode;
+      console.log(`Connection closed with status code: ${reason || 'unknown'}`);
+
+      // Clear the QR code so the page shows initializing state during reconnect
+      qrCodeData = null; 
+
+      // 1. If session is corrupt or logged out, wipe the directory to trigger fresh QR
+      if (reason === DisconnectReason.badSession || reason === DisconnectReason.loggedOut) {
+        console.log('Bad session or user logged out. Wiping credentials to reset...');
+        clearSessionDirectory();
+        connectionStatus = 'Logged Out (Resetting...)';
+      } else {
+        connectionStatus = 'Disconnected (Reconnecting...)';
       }
+
+      // 2. Prevent rapid multi-connection spawn
+      if (!isReconnecting) {
+        isReconnecting = true;
+        console.log('Reconnecting in 5 seconds to prevent rate-limiting...');
+        
+        setTimeout(() => {
+          isReconnecting = false;
+          startBot();
+        }, 5000); // 5-second cooling period
+      }
+
     } else if (connection === 'open') {
       console.log('Connected to WhatsApp successfully!');
       connectionStatus = 'Connected';
@@ -46,10 +86,9 @@ async function startBot() {
 
     const sender = msg.key.remoteJid;
 
-    // RULE: Do not respond in groups. 
-    // In WhatsApp, individual numbers end with '@s.whatsapp.net', while group chats end with '@g.us'.
+    // Do not respond in groups
     if (sender.endsWith('@g.us')) {
-      console.log(`Message from group ${sender} ignored.`);
+      console.log(`Group message ignored from: ${sender}`);
       return; 
     }
 
@@ -57,19 +96,15 @@ async function startBot() {
 
     if (text) {
       console.log(`DM from ${sender}: ${text}`);
-      
-      // Simulate typing state in the chat
       await sock.sendPresenceUpdate('composing', sender);
-      
       const reply = await getAIResponse(text);
-      
       await sock.sendPresenceUpdate('paused', sender);
       await sock.sendMessage(sender, { text: reply });
     }
   });
 }
 
-// Web Dashboard routes to scan QR or display bot online status
+// Web UI Dashboard
 app.get('/', async (req, res) => {
   if (connectionStatus === 'Connected') {
     res.send(`
