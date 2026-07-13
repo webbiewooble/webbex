@@ -9,6 +9,7 @@ const app = express();
 const port = process.env.PORT || 8080;
 
 let pairingCode = null;
+let pairingCodeTimestamp = 0; // Tracks when the active code was generated
 let connectionStatus = 'Disconnected';
 let isReconnecting = false;
 let pairingCodeRequested = false;
@@ -18,7 +19,7 @@ function clearSessionDirectory() {
   if (fs.existsSync(dir)) {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
-      console.log('✓ Cleared corrupt session directory.');
+      console.log('✓ Cleared stale/unregistered session directory successfully.');
     } catch (err) {
       console.error('Failed to clear session directory:', err);
     }
@@ -26,7 +27,20 @@ function clearSessionDirectory() {
 }
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  let authState = await useMultiFileAuthState('auth_info_baileys');
+  let state = authState.state;
+  let saveCreds = authState.saveCreds;
+
+  const isRegistered = state?.creds?.registered || false;
+
+  if (!isRegistered) {
+    console.log('Bot starting in unregistered state. Purging stale pre-keys for a clean slate...');
+    clearSessionDirectory();
+    
+    const freshAuth = await useMultiFileAuthState('auth_info_baileys');
+    state = freshAuth.state;
+    saveCreds = freshAuth.saveCreds;
+  }
 
   if (!process.env.PHONE_NUMBER) {
     connectionStatus = 'Error: PHONE_NUMBER variable missing in Railway Dashboard!';
@@ -50,7 +64,7 @@ async function startBot() {
     version: waVersion,
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: ['Ubuntu', 'Chrome', '20.0.04'] 
+    browser: ['Windows', 'Chrome', '124.0.0.0'] 
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -58,24 +72,32 @@ async function startBot() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     
-    if (qr && !sock.authState.creds.registered && process.env.PHONE_NUMBER && !pairingCodeRequested) {
-      pairingCodeRequested = true;
-      connectionStatus = 'Generating Pairing Code...';
-      try {
-        const cleanNumber = process.env.PHONE_NUMBER.replace(/[^0-9]/g, '');
-        console.log(`Requesting pairing code for clean number: ${cleanNumber}`);
+    if (qr && !sock.authState.creds.registered && process.env.PHONE_NUMBER) {
+      const now = Date.now();
+      // If code is older than 2 minutes (120,000 ms), mark it as expired to request a new one
+      const isExpired = (now - pairingCodeTimestamp) > 120000;
+
+      if (!pairingCodeRequested || isExpired) {
+        pairingCodeRequested = true;
+        pairingCodeTimestamp = now;
+        connectionStatus = 'Generating Fresh Pairing Code...';
         
-        const code = await sock.requestPairingCode(cleanNumber);
-        pairingCode = code;
-        connectionStatus = 'Pairing Code Ready';
-        
-        console.log(`\n=========================================\n`);
-        console.log(`YOUR WHATSAPP PAIRING CODE: ${code}`);
-        console.log(`\n=========================================\n`);
-      } catch (err) {
-        console.error('Failed to request pairing code:', err);
-        connectionStatus = 'Pairing Request Failed';
-        pairingCodeRequested = false; 
+        try {
+          const cleanNumber = process.env.PHONE_NUMBER.replace(/[^0-9]/g, '');
+          console.log(`Requesting fresh pairing code for clean number: ${cleanNumber}`);
+          
+          const code = await sock.requestPairingCode(cleanNumber);
+          pairingCode = code;
+          connectionStatus = 'Pairing Code Ready';
+          
+          console.log(`\n=========================================\n`);
+          console.log(`YOUR FRESH WHATSAPP PAIRING CODE: ${code}`);
+          console.log(`\n=========================================\n`);
+        } catch (err) {
+          console.error('Failed to request pairing code:', err);
+          connectionStatus = 'Pairing Request Failed';
+          pairingCodeRequested = false; 
+        }
       }
     }
     
@@ -83,12 +105,9 @@ async function startBot() {
       const reason = lastDisconnect?.error?.output?.statusCode;
       console.log(`Connection closed with status code: ${reason || 'unknown'}`);
 
-      // Read registered state directly from credentials
-      const isRegistered = state?.creds?.registered || false;
+      const wasRegistered = state?.creds?.registered || false;
 
-      // Safely ignore 401 (loggedOut) or 500 (badSession) if we are still pairing.
-      // Wiping credentials is only necessary if the session was previously registered and active.
-      if (isRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
+      if (wasRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
         console.log('Active session logged out or corrupted. Wiping credentials to reset...');
         clearSessionDirectory();
         connectionStatus = 'Logged Out (Resetting...)';
@@ -96,7 +115,6 @@ async function startBot() {
         pairingCodeRequested = false;
       } else {
         connectionStatus = 'Disconnected (Reconnecting...)';
-        // Note: Do not clear pairingCode or pairingCodeRequested to preserve pairing state on reconnect
       }
 
       if (!isReconnecting) {
@@ -160,7 +178,7 @@ app.get('/', async (req, res) => {
             <p>Enter this code on your WhatsApp mobile app:</p>
             <div class="code">${pairingCode}</div>
             <p style="color: #666;"><small>To link, open WhatsApp on your phone:<br><strong>Settings</strong> → <strong>Linked Devices</strong> → <strong>Link a Device</strong> → <strong>Link with phone number instead</strong></small></p>
-            <p><small>This page auto-refreshes. Once successfully linked, the status changes to Online.</small></p>
+            <p><small>This page auto-refreshes. Old codes automatically expire and refresh every 2 minutes.</small></p>
           </div>
         </body>
       </html>
@@ -175,7 +193,7 @@ app.get('/', async (req, res) => {
             <p>Status: <span class="${connectionStatus.includes('Error') ? 'error-msg' : ''}"><strong>${connectionStatus}</strong></span></p>
             ${connectionStatus.includes('Error') ? 
               '<p>Please configure the <code>PHONE_NUMBER</code> variable inside your Railway Dashboard, then rebuild the service.</p>' : 
-              '<p>Requesting secure handshake version and pairing code. Please wait a few seconds...</p>'
+              '<p>Requesting fresh, active pairing code. Please wait a few seconds...</p>'
             }
           </div>
         </body>
