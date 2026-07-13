@@ -9,7 +9,7 @@ const app = express();
 const port = process.env.PORT || 8080;
 
 let pairingCode = null;
-let pairingCodeTimestamp = 0; // Tracks when the active code was generated
+let pairingCodeTimestamp = 0; 
 let connectionStatus = 'Disconnected';
 let isReconnecting = false;
 let pairingCodeRequested = false;
@@ -33,6 +33,7 @@ async function startBot() {
 
   const isRegistered = state?.creds?.registered || false;
 
+  // Clear directory only if starting completely clean & unregistered
   if (!isRegistered) {
     console.log('Bot starting in unregistered state. Purging stale pre-keys for a clean slate...');
     clearSessionDirectory();
@@ -74,7 +75,6 @@ async function startBot() {
     
     if (qr && !sock.authState.creds.registered && process.env.PHONE_NUMBER) {
       const now = Date.now();
-      // If code is older than 2 minutes (120,000 ms), mark it as expired to request a new one
       const isExpired = (now - pairingCodeTimestamp) > 120000;
 
       if (!pairingCodeRequested || isExpired) {
@@ -107,6 +107,14 @@ async function startBot() {
 
       const wasRegistered = state?.creds?.registered || false;
 
+      // CRITICAL UPDATE: If WhatsApp server returns restartRequired (515) after pairing,
+      // reconnect INSTANTLY with no delay to finalize the secure device registration handshake.
+      if (reason === DisconnectReason.restartRequired) {
+        console.log('✓ Got restartRequired (515). Reconnecting IMMEDIATELY to complete pairing...');
+        startBot();
+        return; 
+      }
+
       if (wasRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
         console.log('Active session logged out or corrupted. Wiping credentials to reset...');
         clearSessionDirectory();
@@ -122,7 +130,7 @@ async function startBot() {
         setTimeout(() => {
           isReconnecting = false;
           startBot();
-        }, 5000);
+        }, 5000); // 5-second delay for standard network drops (like 408 / 428)
       }
 
     } else if (connection === 'open') {
