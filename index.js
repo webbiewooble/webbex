@@ -1,5 +1,4 @@
 const express = require('express');
-// Switched to fetchLatestWaWebVersion for correct, up-to-date protocol checks
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
@@ -7,7 +6,6 @@ const path = require('path');
 const { getAIResponse } = require('./ai');
 
 const app = express();
-// Explicitly default to port 8080 for Webbex in Railway
 const port = process.env.PORT || 8080;
 
 let pairingCode = null;
@@ -30,18 +28,13 @@ function clearSessionDirectory() {
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
-  // Verify if PHONE_NUMBER variable exists in Railway
   if (!process.env.PHONE_NUMBER) {
     connectionStatus = 'Error: PHONE_NUMBER variable missing in Railway Dashboard!';
-    console.error('==================================================');
     console.error('CRITICAL ERROR: PHONE_NUMBER is not set in Railway variables!');
-    console.error('Please add PHONE_NUMBER with your number (e.g., 919318399511)');
-    console.error('==================================================');
     return;
   }
 
-  // Fetch the actual current WhatsApp Web version to prevent handshake rejection
-  let waVersion = [2, 3000, 1042466098]; // Reliable fallback version
+  let waVersion = [2, 3000, 1042466098]; 
   try {
     const fetched = await fetchLatestWaWebVersion();
     if (fetched && fetched.version) {
@@ -54,10 +47,9 @@ async function startBot() {
 
   const sock = makeWASocket({
     auth: state,
-    version: waVersion, // Force modern protocol connection
+    version: waVersion,
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    // Explicit standard browser footprint required for secure pairing
     browser: ['Ubuntu', 'Chrome', '20.0.04'] 
   });
 
@@ -66,7 +58,6 @@ async function startBot() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     
-    // Request pairing code when QR signature event triggers
     if (qr && !sock.authState.creds.registered && process.env.PHONE_NUMBER && !pairingCodeRequested) {
       pairingCodeRequested = true;
       connectionStatus = 'Generating Pairing Code...';
@@ -92,14 +83,20 @@ async function startBot() {
       const reason = lastDisconnect?.error?.output?.statusCode;
       console.log(`Connection closed with status code: ${reason || 'unknown'}`);
 
-      pairingCode = null; 
-      pairingCodeRequested = false;
+      // Read registered state directly from credentials
+      const isRegistered = state?.creds?.registered || false;
 
-      if (reason === DisconnectReason.badSession || reason === DisconnectReason.loggedOut) {
+      // Safely ignore 401 (loggedOut) or 500 (badSession) if we are still pairing.
+      // Wiping credentials is only necessary if the session was previously registered and active.
+      if (isRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
+        console.log('Active session logged out or corrupted. Wiping credentials to reset...');
         clearSessionDirectory();
         connectionStatus = 'Logged Out (Resetting...)';
+        pairingCode = null;
+        pairingCodeRequested = false;
       } else {
         connectionStatus = 'Disconnected (Reconnecting...)';
+        // Note: Do not clear pairingCode or pairingCodeRequested to preserve pairing state on reconnect
       }
 
       if (!isReconnecting) {
