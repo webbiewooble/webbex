@@ -1,6 +1,5 @@
 const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
@@ -9,11 +8,11 @@ const { getAIResponse } = require('./ai');
 const app = express();
 const port = process.env.PORT || 3000;
 
-let qrCodeData = null;
+let pairingCode = null;
 let connectionStatus = 'Disconnected';
 let isReconnecting = false;
+let pairingCodeRequested = false;
 
-// Helper function to automatically wipe corrupted auth files
 function clearSessionDirectory() {
   const dir = path.join(__dirname, 'auth_info_baileys');
   if (fs.existsSync(dir)) {
@@ -31,52 +30,68 @@ async function startBot() {
 
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: true,
+    printQRInTerminal: false, // Turn off terminal QR so it uses pairing code instead
     logger: pino({ level: 'silent' }),
-    // Emulates standard desktop Google Chrome to bypass instant rejections
+    // Use standard desktop browser values for secure authentication
     browser: ['Mac OS', 'Chrome', '10.1.10'] 
   });
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      qrCodeData = qr;
-      connectionStatus = 'Waiting for Scan';
+    
+    // Generate pairing code when a connection prompt (QR) is received
+    if (qr && !sock.authState.creds.registered && process.env.PHONE_NUMBER && !pairingCodeRequested) {
+      pairingCodeRequested = true;
+      connectionStatus = 'Generating Pairing Code...';
+      try {
+        // Strip plus signs, spaces, or dashes to format as clean E.164
+        const cleanNumber = process.env.PHONE_NUMBER.replace(/[^0-9]/g, '');
+        console.log(`Requesting pairing code for: ${cleanNumber}`);
+        
+        const code = await sock.requestPairingCode(cleanNumber);
+        pairingCode = code;
+        connectionStatus = 'Pairing Code Ready';
+        
+        console.log(`\n=========================================\n`);
+        console.log(`YOUR WHATSAPP PAIRING CODE: ${code}`);
+        console.log(`\n=========================================\n`);
+      } catch (err) {
+        console.error('Failed to request pairing code:', err);
+        connectionStatus = 'Pairing Request Failed';
+        pairingCodeRequested = false; 
+      }
     }
     
     if (connection === 'close') {
       const reason = lastDisconnect?.error?.output?.statusCode;
       console.log(`Connection closed with status code: ${reason || 'unknown'}`);
 
-      // Clear the QR code so the page shows initializing state during reconnect
-      qrCodeData = null; 
+      pairingCode = null; 
+      pairingCodeRequested = false;
 
-      // 1. If session is corrupt or logged out, wipe the directory to trigger fresh QR
       if (reason === DisconnectReason.badSession || reason === DisconnectReason.loggedOut) {
-        console.log('Bad session or user logged out. Wiping credentials to reset...');
+        console.log('Bad session or user logged out. Wiping credentials...');
         clearSessionDirectory();
         connectionStatus = 'Logged Out (Resetting...)';
       } else {
         connectionStatus = 'Disconnected (Reconnecting...)';
       }
 
-      // 2. Prevent rapid multi-connection spawn
       if (!isReconnecting) {
         isReconnecting = true;
-        console.log('Reconnecting in 5 seconds to prevent rate-limiting...');
-        
         setTimeout(() => {
           isReconnecting = false;
           startBot();
-        }, 5000); // 5-second cooling period
+        }, 5000);
       }
 
     } else if (connection === 'open') {
       console.log('Connected to WhatsApp successfully!');
       connectionStatus = 'Connected';
-      qrCodeData = null;
+      pairingCode = null;
+      pairingCodeRequested = false;
     }
   });
 
@@ -87,10 +102,7 @@ async function startBot() {
     const sender = msg.key.remoteJid;
 
     // Do not respond in groups
-    if (sender.endsWith('@g.us')) {
-      console.log(`Group message ignored from: ${sender}`);
-      return; 
-    }
+    if (sender.endsWith('@g.us')) return; 
 
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
 
@@ -119,35 +131,31 @@ app.get('/', async (req, res) => {
         </body>
       </html>
     `);
-  } else if (qrCodeData) {
-    try {
-      const qrImage = await qrcode.toDataURL(qrCodeData);
-      res.send(`
-        <html>
-          <head><title>Scan QR - Webbiewooble</title><meta http-equiv="refresh" content="15"><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 30px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); } img { border: 1px solid #ccc; padding: 10px; border-radius: 5px; margin-top: 15px; } h1 { color: #128c7e; }</style></head>
-          <body>
-            <div class="card">
-              <h1>Link Your Webbiewooble Bot</h1>
-              <p>Status: <strong>${connectionStatus}</strong></p>
-              <p>Scan this QR code with WhatsApp Link Devices:</p>
-              <img src="${qrImage}" alt="QR Code" />
-              <p><small>This page auto-refreshes every 15 seconds to fetch updated code.</small></p>
-            </div>
-          </body>
-        </html>
-      `);
-    } catch (err) {
-      res.status(500).send('Error rendering the QR code.');
-    }
+  } else if (pairingCode) {
+    res.send(`
+      <html>
+        <head><title>Pairing Code - Webbiewooble</title><meta http-equiv="refresh" content="15"><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 35px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); } .code { font-size: 34px; font-weight: bold; letter-spacing: 4px; color: #128c7e; background-color: #e3f2fd; padding: 15px 25px; border-radius: 5px; margin: 20px 0; display: inline-block; font-family: monospace; } h1 { color: #128c7e; }</style></head>
+        <body>
+          <div class="card">
+            <h1>Link Your Webbiewooble Bot</h1>
+            <p>Status: <strong>${connectionStatus}</strong></p>
+            <p>Enter this code on your WhatsApp mobile app:</p>
+            <div class="code">${pairingCode}</div>
+            <p style="color: #666;"><small>To link, open WhatsApp on your phone:<br><strong>Settings</strong> → <strong>Linked Devices</strong> → <strong>Link a Device</strong> → <strong>Link with phone number instead</strong></small></p>
+            <p><small>This page auto-refreshes. Once successfully linked, the status changes to Online.</small></p>
+          </div>
+        </body>
+      </html>
+    `);
   } else {
     res.send(`
       <html>
-        <head><title>Loading...</title><meta http-equiv="refresh" content="5"><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 30px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }</style></head>
+        <head><title>Initializing...</title><meta http-equiv="refresh" content="5"><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 30px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }</style></head>
         <body>
           <div class="card">
             <h1>Initializing Bot Session...</h1>
             <p>Status: <strong>${connectionStatus}</strong></p>
-            <p>Please wait. This page will refresh automatically in a few seconds.</p>
+            <p>Preparing to request your pairing code. Please wait a few seconds...</p>
           </div>
         </body>
       </html>
