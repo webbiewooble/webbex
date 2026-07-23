@@ -1,26 +1,3 @@
-This is a critical feature for any real-world business chatbot. If you are
-actively talking or calling a client yourself, the AI must step aside and not
-send automatic, overlapping replies.
-
-How we will solve this (Smart Auto-Pause)
-
-We will implement an automatic 15-minute mute timer in index.js. It works purely
-in the background without you having to configure or type any commands:
-
-1.  Manual Text Detection: The moment you send a message manually from your
-    phone (fromMe === true), the bot detects it and instantly pauses the AI for
-    that specific client for 15 minutes [2].
-2.  WhatsApp Call Detection: If you place or receive a WhatsApp call (audio or
-    video) with a client, the bot registers the call event and instantly pauses
-    the AI for that client [2].
-3.  Auto-Resume: Every manual text or call resets the 15-minute countdown. If 15
-    minutes pass with absolutely no manual texts or calls, the AI assumes you
-    are done and automatically resumes duty for that chat.
-
-Updated index.js (with Smart Auto-Pause)
-
-Replace your index.js file with this complete version:
-
 const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
@@ -38,9 +15,9 @@ let pairingCodeRequested = false;
 
 // SMART AUTO-PAUSE MEMORY
 const lastManualActive = {}; 
-const AUTO_MUTE_DURATION = 15 * 60 * 1000; // 15 minutes in milliseconds (Change this number to adjust duration)
+const AUTO_MUTE_DURATION = 15 * 60 * 1000; // 15 minutes in milliseconds
 
-// Prevent random background network/API errors from crashing the process
+// Prevent background network or API errors from crashing the process
 process.on('uncaughtException', (err) => {
   console.error('CRITICAL: Caught Uncaught Exception to prevent crash:', err);
 });
@@ -161,23 +138,23 @@ async function startBot() {
 
       const sender = msg.key.remoteJid;
 
-      // 1. If you send a message manually from your phone, record the timestamp & pause the AI
+      // If you send a message manually from your phone, record the timestamp & pause the AI
       if (msg.key.fromMe) {
         lastManualActive[sender] = Date.now();
         console.log(`Manual message detected for ${sender}. Pausing AI response.`);
-        return; // Do not let the AI reply to your own manual messages
+        return; 
       }
 
       if (sender.endsWith('@g.us')) return; 
 
-      // 2. Check if the AI is currently muted for this specific client
+      // Check if the AI is currently muted for this specific client
       const lastManualTime = lastManualActive[sender] || 0;
       const timePassed = Date.now() - lastManualTime;
       
       if (timePassed < AUTO_MUTE_DURATION) {
         const minutesRemaining = Math.ceil((AUTO_MUTE_DURATION - timePassed) / 60000);
         console.log(`AI is currently PAUSED for ${sender} (${minutesRemaining} mins remaining) because you recently chatted/called manually.`);
-        return; // Silent bypass: Let you talk manually without AI interruption
+        return; 
       }
 
       const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
@@ -250,16 +227,3 @@ app.listen(port, () => {
 });
 
 startBot();
-
-Next Steps:
-
-1.  Save the file and push the update:
-    git add index.js
-    git commit -m "Implement smart auto-pause for personal chats and calls"
-    git push origin main
-2.  Once Railway finishes deploying, you are ready to test it.
-
-How to test it: If you send a WhatsApp message to a client yourself, look at
-your Railway logs. You will see: Manual message detected. Pausing AI response.
-For the next 15 minutes, you can have a normal personal conversation without the
-AI sending any automated replies!
