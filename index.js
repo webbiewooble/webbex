@@ -12,7 +12,6 @@ let pairingCode = null;
 let connectionStatus = 'Disconnected';
 let isReconnecting = false;
 let pairingCodeRequested = false;
-let isFirstBoot = true; // Tracks if this is the very first boot of the server
 
 // SMART AUTO-PAUSE MEMORY
 const lastManualActive = {}; 
@@ -40,33 +39,10 @@ function clearSessionDirectory() {
 }
 
 async function startBot() {
-  let authState = await useMultiFileAuthState('auth_info_baileys');
-  let state = authState.state;
-  let saveCreds = authState.saveCreds;
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
-  const isRegistered = state?.creds?.registered || false;
-
-  // CRITICAL FIX: Only purge files on the very FIRST boot.
-  // Do NOT purge on routine 408 reconnects so the pairing code stays active and doesn't change!
-  if (!isRegistered && isFirstBoot) {
-    isFirstBoot = false;
-    console.log('Bot starting in unregistered state (First Boot). Purging stale pre-keys for a clean slate...');
-    clearSessionDirectory();
-    
-    const freshAuth = await useMultiFileAuthState('auth_info_baileys');
-    state = freshAuth.state;
-    saveCreds = freshAuth.saveCreds;
-  } else {
-    isFirstBoot = false; // Mark first boot as completed for subsequent reconnects
-  }
-
-  if (!process.env.PHONE_NUMBER) {
-    connectionStatus = 'Error: PHONE_NUMBER variable missing in Railway Dashboard!';
-    console.error('CRITICAL ERROR: PHONE_NUMBER is not set in Railway variables!');
-    return;
-  }
-
-  let waVersion = [2, 3000, 1042466098]; 
+  // Fallback set to the exact modern working version from your logs
+  let waVersion = [2, 3000, 1043708157]; 
   try {
     const fetched = await fetchLatestWaWebVersion();
     if (fetched && fetched.version) {
@@ -87,6 +63,7 @@ async function startBot() {
 
   sock.ev.on('creds.update', saveCreds);
 
+  // LISTEN FOR CALL EVENTS: Pause the AI if you call or get called
   sock.ev.on('call', (calls) => {
     try {
       for (const call of calls) {
@@ -132,16 +109,23 @@ async function startBot() {
       pairingCode = null; 
       pairingCodeRequested = false;
 
-      // Handle Immediate Reconnect for status 515 (restartRequired)
+      const isRegistered = state?.creds?.registered || false;
+
+      // 1. LOOP BREAKER: If unregistered and connection closes due to bad session or unauthorized (401/500),
+      // wipe the folder immediately to reset the cryptographic handshake and generate a clean pairing code.
+      if (!isRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
+        console.log('Unregistered session keys corrupted or expired. Purging to break reconnection loop...');
+        clearSessionDirectory();
+      }
+
+      // 2. Instant 515 Reconnect: Reconnect immediately when pairing is accepted
       if (reason === DisconnectReason.restartRequired) {
         console.log('✓ Got restartRequired (515). Reconnecting IMMEDIATELY to complete pairing...');
         startBot();
         return; 
       }
 
-      const wasRegistered = state?.creds?.registered || false;
-
-      if (wasRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
+      if (isRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
         clearSessionDirectory();
         connectionStatus = 'Logged Out (Resetting...)';
       } else {
