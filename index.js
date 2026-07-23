@@ -13,6 +13,15 @@ let connectionStatus = 'Disconnected';
 let isReconnecting = false;
 let pairingCodeRequested = false;
 
+// CRITICAL SAFETY GUARD: Prevent random background network/API errors from crashing the process
+process.on('uncaughtException', (err) => {
+  console.error('CRITICAL: Caught Uncaught Exception to prevent crash:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('CRITICAL: Caught Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 function clearSessionDirectory() {
   const dir = path.join(__dirname, 'auth_info_baileys');
   if (fs.existsSync(dir)) {
@@ -104,20 +113,24 @@ async function startBot() {
   });
 
   sock.ev.on('messages.upsert', async (m) => {
-    const msg = m.messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+    try {
+      const msg = m.messages[0];
+      if (!msg.message || msg.key.fromMe) return;
 
-    const sender = msg.key.remoteJid;
-    if (sender.endsWith('@g.us')) return; 
+      const sender = msg.key.remoteJid;
+      if (sender.endsWith('@g.us')) return; 
 
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
+      const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
 
-    if (text) {
-      console.log(`DM from ${sender}: ${text}`);
-      await sock.sendPresenceUpdate('composing', sender);
-      const reply = await getAIResponse(text);
-      await sock.sendPresenceUpdate('paused', sender);
-      await sock.sendMessage(sender, { text: reply });
+      if (text) {
+        console.log(`DM from ${sender}: ${text}`);
+        await sock.sendPresenceUpdate('composing', sender);
+        const reply = await getAIResponse(text);
+        await sock.sendPresenceUpdate('paused', sender);
+        await sock.sendMessage(sender, { text: reply });
+      }
+    } catch (msgErr) {
+      console.error('Error processing incoming message:', msgErr.message);
     }
   });
 }
