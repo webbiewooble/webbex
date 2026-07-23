@@ -12,12 +12,14 @@ let pairingCode = null;
 let connectionStatus = 'Disconnected';
 let isReconnecting = false;
 let pairingCodeRequested = false;
+let activeSock = null; // Globally tracks the active WhatsApp socket for keep-alive pings
 
 // SMART AUTO-PAUSE MEMORY
 const lastManualActive = {}; 
 const botMessageIds = new Set(); 
 const AUTO_MUTE_DURATION = 15 * 60 * 1000; 
 
+// Prevent background network or API errors from crashing the process
 process.on('uncaughtException', (err) => {
   console.error('CRITICAL: Caught Uncaught Exception to prevent crash:', err);
 });
@@ -41,8 +43,25 @@ function clearSessionDirectory() {
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
-  // Fallback set to the exact modern working version from your logs
-  let waVersion = [2, 3000, 1043708157]; 
+  const isRegistered = state?.creds?.registered || false;
+
+  // Only clear the directory if starting fresh and completely unregistered
+  if (!isRegistered) {
+    console.log('Bot starting in unregistered state. Purging stale pre-keys for a clean slate...');
+    clearSessionDirectory();
+    
+    const freshAuth = await useMultiFileAuthState('auth_info_baileys');
+    state = freshAuth.state;
+    saveCreds = freshAuth.saveCreds;
+  }
+
+  if (!process.env.PHONE_NUMBER) {
+    connectionStatus = 'Error: PHONE_NUMBER variable missing in Railway Dashboard!';
+    console.error('CRITICAL ERROR: PHONE_NUMBER is not set in Railway variables!');
+    return;
+  }
+
+  let waVersion = [2, 3000, 1043708157]; // Set fallback to modern working logs version
   try {
     const fetched = await fetchLatestWaWebVersion();
     if (fetched && fetched.version) {
@@ -55,15 +74,22 @@ async function startBot() {
 
   const sock = makeWASocket({
     auth: state,
-    version: waVersion,
+    version: waVersion, 
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: ['Ubuntu', 'Chrome', '20.0.04'] 
+    browser: ['Ubuntu', 'Chrome', '20.0.04'],
+    
+    // ADVANCED ACTIVE CONNECTION KEEP-ALIVES
+    keepAliveIntervalMs: 15000,   // Ping WhatsApp every 15 seconds to prevent network idle timeout
+    connectTimeoutMs: 60000,      // Allow up to 60 seconds for slow cloud handshakes
+    defaultQueryTimeoutMs: 0,     // Disable timeout for queries to prevent random disconnects
+    retryRequestDelayMs: 5000     // Delay between query retries
   });
 
+  activeSock = sock; // Store socket globally for keep-alive interval
   sock.ev.on('creds.update', saveCreds);
 
-  // LISTEN FOR CALL EVENTS: Pause the AI if you call or get called
+  // Listen for call events to trigger auto-pause
   sock.ev.on('call', (calls) => {
     try {
       for (const call of calls) {
@@ -108,29 +134,24 @@ async function startBot() {
 
       pairingCode = null; 
       pairingCodeRequested = false;
+      activeSock = null;
 
       const isRegistered = state?.creds?.registered || false;
 
-      // 1. LOOP BREAKER: If unregistered and connection closes due to bad session or unauthorized (401/500),
-      // wipe the folder immediately to reset the cryptographic handshake and generate a clean pairing code.
+      // Only wipe credentials on close if we are UNREGISTERED (pairing failed / expired)
       if (!isRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
-        console.log('Unregistered session keys corrupted or expired. Purging to break reconnection loop...');
+        console.log('Unregistered pairing session keys corrupted or expired. Purging credentials...');
         clearSessionDirectory();
       }
 
-      // 2. Instant 515 Reconnect: Reconnect immediately when pairing is accepted
+      // Handle Immediate Reconnect for status 515 (restartRequired)
       if (reason === DisconnectReason.restartRequired) {
         console.log('✓ Got restartRequired (515). Reconnecting IMMEDIATELY to complete pairing...');
         startBot();
         return; 
       }
 
-      if (isRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
-        clearSessionDirectory();
-        connectionStatus = 'Logged Out (Resetting...)';
-      } else {
-        connectionStatus = 'Disconnected (Reconnecting...)';
-      }
+      connectionStatus = 'Disconnected (Reconnecting...)';
 
       if (!isReconnecting) {
         isReconnecting = true;
@@ -196,6 +217,19 @@ async function startBot() {
     }
   });
 }
+
+// 3. BACKGROUND ANTI-IDLE INTERVAL:
+// Simulates a presence ping to WhatsApp every 5 minutes to keep the WebSocket active
+setInterval(async () => {
+  if (activeSock && connectionStatus === 'Connected') {
+    try {
+      console.log('Sending background keep-alive presence ping...');
+      await activeSock.sendPresenceUpdate('available');
+    } catch (err) {
+      console.warn('Background keep-alive ping skipped (normal if connection is reconnecting):', err.message);
+    }
+  }
+}, 5 * 60 * 1000); // 5 minutes
 
 // Web Dashboard
 app.get('/', async (req, res) => {
