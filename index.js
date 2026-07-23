@@ -1,6 +1,7 @@
 const express = require('express');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
+const qrcode = require('qrcode'); // Re-added QR renderer for iPad screen scanning
 const fs = require('fs');
 const path = require('path');
 const { getAIResponse } = require('./ai');
@@ -8,18 +9,19 @@ const { getAIResponse } = require('./ai');
 const app = express();
 const port = process.env.PORT || 8080;
 
+let rawQrData = null;
 let pairingCode = null;
 let connectionStatus = 'Disconnected';
 let isReconnecting = false;
 let pairingCodeRequested = false;
-let activeSock = null; // Globally tracks the active socket for 24/7 pings
+let activeSock = null;
 
 // SMART AUTO-PAUSE MEMORY
 const lastManualActive = {}; 
 const botMessageIds = new Set(); 
-const AUTO_MUTE_DURATION = 15 * 60 * 1000; // 15 minutes in milliseconds
+const AUTO_MUTE_DURATION = 15 * 60 * 1000; 
 
-// CRITICAL SAFETY GUARDS: Prevent crashes from background network/API glitches
+// CRITICAL SAFETY GUARDS
 process.on('uncaughtException', (err) => {
   console.error('CRITICAL: Caught Uncaught Exception:', err.message);
 });
@@ -47,7 +49,6 @@ async function startBot() {
 
   const isRegistered = state?.creds?.registered || false;
 
-  // Purge files ONLY if starting fresh and completely unregistered
   if (!isRegistered) {
     console.log('Bot starting in unregistered state. Purging stale pre-keys for clean slate...');
     clearSessionDirectory();
@@ -63,7 +64,7 @@ async function startBot() {
     return;
   }
 
-  let waVersion = [2, 3000, 1043708157]; // Tested modern fallback version
+  let waVersion = [2, 3000, 1043708157]; 
   try {
     const fetched = await fetchLatestWaWebVersion();
     if (fetched && fetched.version) {
@@ -81,17 +82,15 @@ async function startBot() {
     logger: pino({ level: 'silent' }),
     browser: ['Ubuntu', 'Chrome', '20.0.04'],
     
-    // ADVANCED ACTIVE CONNECTION KEEP-ALIVES (FOR 24/7 RUNTIME)
-    keepAliveIntervalMs: 15000,   // Ping WhatsApp every 15 seconds
-    connectTimeoutMs: 60000,      // Allow up to 60s for cloud handshakes
-    defaultQueryTimeoutMs: 0,     // Disable query timeouts to prevent drops
-    retryRequestDelayMs: 5000,    // Delay between request retries
-    markOnlineOnConnect: true     // Keep account active on connection
+    keepAliveIntervalMs: 15000,   
+    connectTimeoutMs: 60000,      
+    defaultQueryTimeoutMs: 0,     
+    retryRequestDelayMs: 5000,    
+    markOnlineOnConnect: true     
   });
 
-  activeSock = sock; // Store active socket reference
+  activeSock = sock; 
 
-  // Explicitly await saveCreds to prevent disk write race conditions
   sock.ev.on('creds.update', async () => {
     try {
       await saveCreds();
@@ -100,7 +99,6 @@ async function startBot() {
     }
   });
 
-  // Handle WhatsApp Call Events for Auto-Pause
   sock.ev.on('call', (calls) => {
     try {
       for (const call of calls) {
@@ -115,7 +113,6 @@ async function startBot() {
     }
   });
 
-  // Handle Connection State Updates
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -123,22 +120,24 @@ async function startBot() {
       connectionStatus = 'Connecting...';
     }
 
-    if (qr && !sock.authState.creds.registered && process.env.PHONE_NUMBER && !pairingCodeRequested) {
-      pairingCodeRequested = true;
-      connectionStatus = 'Generating Pairing Code...';
-      try {
-        const cleanNumber = process.env.PHONE_NUMBER.replace(/[^0-9]/g, '');
-        console.log(`Requesting pairing code for: ${cleanNumber}`);
-        
-        const code = await sock.requestPairingCode(cleanNumber);
-        pairingCode = code;
-        connectionStatus = 'Pairing Code Ready';
-        
-        console.log(`\n=========================================\nYOUR WHATSAPP PAIRING CODE: ${code}\n=========================================\n`);
-      } catch (err) {
-        console.error('Failed to request pairing code:', err);
-        connectionStatus = 'Pairing Request Failed';
-        pairingCodeRequested = false; 
+    if (qr && !sock.authState.creds.registered) {
+      rawQrData = qr; // Store raw QR payload for iPad camera scanning
+
+      if (process.env.PHONE_NUMBER && !pairingCodeRequested) {
+        pairingCodeRequested = true;
+        connectionStatus = 'Ready to Link';
+        try {
+          const cleanNumber = process.env.PHONE_NUMBER.replace(/[^0-9]/g, '');
+          console.log(`Requesting pairing code for: ${cleanNumber}`);
+          
+          const code = await sock.requestPairingCode(cleanNumber);
+          pairingCode = code;
+          
+          console.log(`\n=========================================\nYOUR WHATSAPP PAIRING CODE: ${code}\n=========================================\n`);
+        } catch (err) {
+          console.error('Failed to request pairing code:', err);
+          pairingCodeRequested = false; 
+        }
       }
     }
 
@@ -146,24 +145,21 @@ async function startBot() {
       const reason = lastDisconnect?.error?.output?.statusCode;
       console.log(`Connection closed with status code: ${reason || 'unknown'}`);
 
+      rawQrData = null;
       pairingCode = null; 
       pairingCodeRequested = false;
       activeSock = null;
 
       const isRegisteredNow = state?.creds?.registered || false;
 
-      // FIX FOR "COULD NOT LINK DEVICE":
-      // Status 515 (restartRequired) means pairing code was ACCEPTED by WhatsApp.
-      // We MUST wait 2 seconds before restarting so Railway's disk volume finishes writing registered: true!
       if (reason === DisconnectReason.restartRequired || reason === 515) {
         console.log('✓ Pairing code accepted by WhatsApp! Flushing credentials to disk before reconnecting...');
         setTimeout(() => {
           startBot();
-        }, 2000); // 2-second buffer solves the disk race condition!
+        }, 2000); 
         return;
       }
 
-      // Clear credentials ONLY if unregistered and connection closed due to 401/500
       if (!isRegisteredNow && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
         console.log('Unregistered session keys corrupted or expired. Purging credentials...');
         clearSessionDirectory();
@@ -182,12 +178,12 @@ async function startBot() {
     } else if (connection === 'open') {
       console.log('Connected to WhatsApp successfully!');
       connectionStatus = 'Connected';
+      rawQrData = null;
       pairingCode = null;
       pairingCodeRequested = false;
     }
   });
 
-  // Handle Incoming / Outgoing Messages
   sock.ev.on('messages.upsert', async (m) => {
     try {
       const msg = m.messages[0];
@@ -196,21 +192,18 @@ async function startBot() {
       const sender = msg.key.remoteJid;
 
       if (msg.key.fromMe) {
-        // If message was sent by the AI bot, ignore it so it doesn't self-mute
         if (botMessageIds.has(msg.key.id)) {
           botMessageIds.delete(msg.key.id); 
           return;
         }
 
-        // If message was sent manually by you from your phone, pause the AI for 15 mins
         lastManualActive[sender] = Date.now();
         console.log(`Manual message detected for ${sender}. Pausing AI response.`);
         return; 
       }
 
-      if (sender.endsWith('@g.us')) return; // Block group messages
+      if (sender.endsWith('@g.us')) return; 
 
-      // Check if AI is currently muted for this contact
       const lastManualTime = lastManualActive[sender] || 0;
       const timePassed = Date.now() - lastManualTime;
       
@@ -240,17 +233,16 @@ async function startBot() {
   });
 }
 
-// 24/7 ANTI-IDLE HEARTBEAT:
-// Sends a presence ping to WhatsApp every 30 seconds to keep the socket alive continuously
+// 24/7 ANTI-IDLE HEARTBEAT
 setInterval(async () => {
   if (activeSock && connectionStatus === 'Connected') {
     try {
       await activeSock.sendPresenceUpdate('available');
     } catch (err) {
-      // Ignored: transient background network variation
+      // transient background network variation
     }
   }
-}, 30 * 1000); // 30 seconds
+}, 30 * 1000); 
 
 // Web Dashboard
 app.get('/', async (req, res) => {
@@ -267,18 +259,52 @@ app.get('/', async (req, res) => {
         </body>
       </html>
     `);
-  } else if (pairingCode) {
+  } else if (rawQrData || pairingCode) {
+    let qrImage = '';
+    if (rawQrData) {
+      try {
+        qrImage = await qrcode.toDataURL(rawQrData);
+      } catch (err) {
+        console.error('Error generating QR image:', err);
+      }
+    }
+
     res.send(`
       <html>
-        <head><title>Pairing Code - Webbiewooble</title><meta http-equiv="refresh" content="15"><style>body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; } .card { background: white; padding: 35px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); } .code { font-size: 34px; font-weight: bold; letter-spacing: 4px; color: #128c7e; background-color: #e3f2fd; padding: 15px 25px; border-radius: 5px; margin: 20px 0; display: inline-block; font-family: monospace; } h1 { color: #128c7e; }</style></head>
+        <head>
+          <title>Link Your Bot - Webbiewooble</title>
+          <meta http-equiv="refresh" content="15">
+          <style>
+            body { font-family: sans-serif; text-align: center; margin-top: 30px; background-color: #f0f2f5; }
+            .card { background: white; padding: 30px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 10px rgba(0,0,0,0.1); max-width: 480px; }
+            .code { font-size: 32px; font-weight: bold; letter-spacing: 4px; color: #128c7e; background-color: #e3f2fd; padding: 12px 20px; border-radius: 6px; margin: 15px 0; display: inline-block; font-family: monospace; }
+            img { border: 2px solid #128c7e; padding: 10px; border-radius: 8px; margin: 10px 0; width: 220px; height: 220px; }
+            h1 { color: #128c7e; margin-bottom: 5px; }
+            .method-box { background: #fafafa; border: 1px solid #e0e0e0; padding: 15px; border-radius: 8px; margin-top: 15px; }
+          </style>
+        </head>
         <body>
           <div class="card">
             <h1>Link Your Webbiewooble Bot</h1>
             <p>Status: <strong>${connectionStatus}</strong></p>
-            <p>Enter this code on your WhatsApp mobile app:</p>
-            <div class="code">${pairingCode}</div>
-            <p style="color: #666;"><small>To link, open WhatsApp on your phone:<br><strong>Settings</strong> → <strong>Linked Devices</strong> → <strong>Link a Device</strong> → <strong>Link with phone number instead</strong></small></p>
-            <p><small>This page auto-refreshes. Once successfully linked, the status changes to Online.</small></p>
+            
+            ${qrImage ? `
+              <div class="method-box">
+                <h3 style="margin-top:0; color:#075e54;">METHOD 1: Scan QR Code (Fastest)</h3>
+                <p><small>Open WhatsApp on phone → <strong>Linked Devices</strong> → <strong>Link a Device</strong> → Point phone camera at this iPad screen:</small></p>
+                <img src="${qrImage}" alt="WhatsApp QR Code" />
+              </div>
+            ` : ''}
+
+            ${pairingCode ? `
+              <div class="method-box">
+                <h3 style="margin-top:0; color:#075e54;">METHOD 2: Pairing Code</h3>
+                <p><small>WhatsApp → Linked Devices → Link with phone number instead:</small></p>
+                <div class="code">${pairingCode}</div>
+              </div>
+            ` : ''}
+
+            <p><small style="color: #888;">This page auto-refreshes every 15 seconds.</small></p>
           </div>
         </body>
       </html>
@@ -293,7 +319,7 @@ app.get('/', async (req, res) => {
             <p>Status: <span class="${connectionStatus.includes('Error') ? 'error-msg' : ''}"><strong>${connectionStatus}</strong></span></p>
             ${connectionStatus.includes('Error') ? 
               '<p>Please configure the <code>PHONE_NUMBER</code> variable inside your Railway Dashboard, then rebuild the service.</p>' : 
-              '<p>Requesting fresh, active pairing code. Please wait a few seconds...</p>'
+              '<p>Generating secure QR code and Pairing code. Please wait a few seconds...</p>'
             }
           </div>
         </body>
