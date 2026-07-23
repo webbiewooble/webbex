@@ -41,7 +41,10 @@ function clearSessionDirectory() {
 }
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  // Declared using LET to prevent TypeError assignment crashes on boot
+  let authData = await useMultiFileAuthState('auth_info_baileys');
+  let state = authData.state;
+  let saveCreds = authData.saveCreds;
 
   const isRegistered = state?.creds?.registered || false;
 
@@ -61,7 +64,7 @@ async function startBot() {
     return;
   }
 
-  let waVersion = [2, 3000, 1043708157]; // Set fallback to modern working logs version
+  let waVersion = [2, 3000, 1043708157]; // Fallback set to modern working version
   try {
     const fetched = await fetchLatestWaWebVersion();
     if (fetched && fetched.version) {
@@ -106,6 +109,11 @@ async function startBot() {
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
+
+    // Track connecting status for dashboard clarity
+    if (connection === 'connecting') {
+      connectionStatus = 'Connecting...';
+    }
     
     if (qr && !sock.authState.creds.registered && process.env.PHONE_NUMBER && !pairingCodeRequested) {
       pairingCodeRequested = true;
@@ -140,7 +148,7 @@ async function startBot() {
 
       // Only wipe credentials on close if we are UNREGISTERED (pairing failed / expired)
       if (!isRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
-        console.log('Unregistered pairing session keys corrupted or expired. Purging credentials...');
+        console.log('Unregistered session keys corrupted or expired. Purging credentials...');
         clearSessionDirectory();
       }
 
@@ -218,7 +226,7 @@ async function startBot() {
   });
 }
 
-// 3. BACKGROUND ANTI-IDLE INTERVAL:
+// BACKGROUND ANTI-IDLE INTERVAL:
 // Simulates a presence ping to WhatsApp every 5 minutes to keep the WebSocket active
 setInterval(async () => {
   if (activeSock && connectionStatus === 'Connected') {
