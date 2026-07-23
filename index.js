@@ -15,6 +15,7 @@ let pairingCodeRequested = false;
 
 // SMART AUTO-PAUSE MEMORY
 const lastManualActive = {}; 
+const botMessageIds = new Set(); // Tracks IDs of messages sent programmatically by the bot
 const AUTO_MUTE_DURATION = 15 * 60 * 1000; // 15 minutes in milliseconds
 
 // Prevent background network or API errors from crashing the process
@@ -138,8 +139,14 @@ async function startBot() {
 
       const sender = msg.key.remoteJid;
 
-      // If you send a message manually from your phone, record the timestamp & pause the AI
       if (msg.key.fromMe) {
+        // If this message ID was generated programmatically by the bot, ignore it and continue
+        if (botMessageIds.has(msg.key.id)) {
+          botMessageIds.delete(msg.key.id); // Clean up memory
+          return;
+        }
+
+        // Otherwise, the message was sent manually by you from your phone. Pause the AI!
         lastManualActive[sender] = Date.now();
         console.log(`Manual message detected for ${sender}. Pausing AI response.`);
         return; 
@@ -161,10 +168,16 @@ async function startBot() {
 
       if (text) {
         console.log(`DM from ${sender}: ${text}`);
+        
         await sock.sendPresenceUpdate('composing', sender);
         const reply = await getAIResponse(text);
         await sock.sendPresenceUpdate('paused', sender);
-        await sock.sendMessage(sender, { text: reply });
+        
+        // Send message and track its ID to prevent self-muting
+        const sentMsg = await sock.sendMessage(sender, { text: reply });
+        if (sentMsg && sentMsg.key && sentMsg.key.id) {
+          botMessageIds.add(sentMsg.key.id);
+        }
       }
     } catch (msgErr) {
       console.error('Error processing incoming message:', msgErr.message);
