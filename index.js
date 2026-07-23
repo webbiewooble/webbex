@@ -32,7 +32,7 @@ function clearSessionDirectory() {
   if (fs.existsSync(dir)) {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
-      console.log('✓ Cleared corrupt session directory.');
+      console.log('✓ Cleared corrupt/stale session directory.');
     } catch (err) {
       console.error('Failed to clear session directory:', err);
     }
@@ -40,7 +40,28 @@ function clearSessionDirectory() {
 }
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+  let authState = await useMultiFileAuthState('auth_info_baileys');
+  let state = authState.state;
+  let saveCreds = authState.saveCreds;
+
+  const isRegistered = state?.creds?.registered || false;
+
+  // 1. Startup Auto-Purge: Clean any corrupted leftover key files for a fresh slate
+  if (!isRegistered) {
+    console.log('Bot starting in unregistered state. Purging stale pre-keys for a clean slate...');
+    clearSessionDirectory();
+    
+    // Reload a completely fresh and empty authentication state
+    const freshAuth = await useMultiFileAuthState('auth_info_baileys');
+    state = freshAuth.state;
+    saveCreds = freshAuth.saveCreds;
+  }
+
+  if (!process.env.PHONE_NUMBER) {
+    connectionStatus = 'Error: PHONE_NUMBER variable missing in Railway Dashboard!';
+    console.error('CRITICAL ERROR: PHONE_NUMBER is not set in Railway variables!');
+    return;
+  }
 
   let waVersion = [2, 3000, 1042466098]; // Reliable fallback version
   try {
@@ -109,7 +130,17 @@ async function startBot() {
       pairingCode = null; 
       pairingCodeRequested = false;
 
-      if (reason === DisconnectReason.badSession || reason === DisconnectReason.loggedOut) {
+      // 2. Instant 515 Reconnect: Reconnect immediately when pairing completes
+      if (reason === DisconnectReason.restartRequired) {
+        console.log('✓ Got restartRequired (515). Reconnecting IMMEDIATELY to complete pairing...');
+        startBot();
+        return; 
+      }
+
+      const wasRegistered = state?.creds?.registered || false;
+
+      if (wasRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
+        console.log('Active session logged out or corrupted. Wiping credentials to reset...');
         clearSessionDirectory();
         connectionStatus = 'Logged Out (Resetting...)';
       } else {
@@ -140,13 +171,13 @@ async function startBot() {
       const sender = msg.key.remoteJid;
 
       if (msg.key.fromMe) {
-        // If this message ID was generated programmatically by the bot, ignore it and continue
+        // 3. Self-Muting Bugfix: Ignore bot's own programmatic replies
         if (botMessageIds.has(msg.key.id)) {
           botMessageIds.delete(msg.key.id); // Clean up memory
           return;
         }
 
-        // Otherwise, the message was sent manually by you from your phone. Pause the AI!
+        // 4. Smart Auto-Pause: Pause AI when manually typing from phone
         lastManualActive[sender] = Date.now();
         console.log(`Manual message detected for ${sender}. Pausing AI response.`);
         return; 
@@ -173,7 +204,7 @@ async function startBot() {
         const reply = await getAIResponse(text);
         await sock.sendPresenceUpdate('paused', sender);
         
-        // Send message and track its ID to prevent self-muting
+        // Track message ID to prevent self-muting
         const sentMsg = await sock.sendMessage(sender, { text: reply });
         if (sentMsg && sentMsg.key && sentMsg.key.id) {
           botMessageIds.add(sentMsg.key.id);
