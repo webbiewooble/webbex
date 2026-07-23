@@ -12,13 +12,13 @@ let pairingCode = null;
 let connectionStatus = 'Disconnected';
 let isReconnecting = false;
 let pairingCodeRequested = false;
+let isFirstBoot = true; // Tracks if this is the very first boot of the server
 
 // SMART AUTO-PAUSE MEMORY
 const lastManualActive = {}; 
-const botMessageIds = new Set(); // Tracks IDs of messages sent programmatically by the bot
-const AUTO_MUTE_DURATION = 15 * 60 * 1000; // 15 minutes in milliseconds
+const botMessageIds = new Set(); 
+const AUTO_MUTE_DURATION = 15 * 60 * 1000; 
 
-// Prevent background network or API errors from crashing the process
 process.on('uncaughtException', (err) => {
   console.error('CRITICAL: Caught Uncaught Exception to prevent crash:', err);
 });
@@ -46,15 +46,18 @@ async function startBot() {
 
   const isRegistered = state?.creds?.registered || false;
 
-  // 1. Startup Auto-Purge: Clean any corrupted leftover key files for a fresh slate
-  if (!isRegistered) {
-    console.log('Bot starting in unregistered state. Purging stale pre-keys for a clean slate...');
+  // CRITICAL FIX: Only purge files on the very FIRST boot.
+  // Do NOT purge on routine 408 reconnects so the pairing code stays active and doesn't change!
+  if (!isRegistered && isFirstBoot) {
+    isFirstBoot = false;
+    console.log('Bot starting in unregistered state (First Boot). Purging stale pre-keys for a clean slate...');
     clearSessionDirectory();
     
-    // Reload a completely fresh and empty authentication state
     const freshAuth = await useMultiFileAuthState('auth_info_baileys');
     state = freshAuth.state;
     saveCreds = freshAuth.saveCreds;
+  } else {
+    isFirstBoot = false; // Mark first boot as completed for subsequent reconnects
   }
 
   if (!process.env.PHONE_NUMBER) {
@@ -63,7 +66,7 @@ async function startBot() {
     return;
   }
 
-  let waVersion = [2, 3000, 1042466098]; // Reliable fallback version
+  let waVersion = [2, 3000, 1042466098]; 
   try {
     const fetched = await fetchLatestWaWebVersion();
     if (fetched && fetched.version) {
@@ -76,7 +79,7 @@ async function startBot() {
 
   const sock = makeWASocket({
     auth: state,
-    version: waVersion, // Force modern protocol connection
+    version: waVersion,
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
     browser: ['Ubuntu', 'Chrome', '20.0.04'] 
@@ -84,7 +87,6 @@ async function startBot() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // LISTEN FOR CALL EVENTS: Pause the AI if you call or get called
   sock.ev.on('call', (calls) => {
     try {
       for (const call of calls) {
@@ -130,7 +132,7 @@ async function startBot() {
       pairingCode = null; 
       pairingCodeRequested = false;
 
-      // 2. Instant 515 Reconnect: Reconnect immediately when pairing completes
+      // Handle Immediate Reconnect for status 515 (restartRequired)
       if (reason === DisconnectReason.restartRequired) {
         console.log('✓ Got restartRequired (515). Reconnecting IMMEDIATELY to complete pairing...');
         startBot();
@@ -140,7 +142,6 @@ async function startBot() {
       const wasRegistered = state?.creds?.registered || false;
 
       if (wasRegistered && (reason === DisconnectReason.loggedOut || reason === DisconnectReason.badSession)) {
-        console.log('Active session logged out or corrupted. Wiping credentials to reset...');
         clearSessionDirectory();
         connectionStatus = 'Logged Out (Resetting...)';
       } else {
@@ -171,13 +172,11 @@ async function startBot() {
       const sender = msg.key.remoteJid;
 
       if (msg.key.fromMe) {
-        // 3. Self-Muting Bugfix: Ignore bot's own programmatic replies
         if (botMessageIds.has(msg.key.id)) {
-          botMessageIds.delete(msg.key.id); // Clean up memory
+          botMessageIds.delete(msg.key.id); 
           return;
         }
 
-        // 4. Smart Auto-Pause: Pause AI when manually typing from phone
         lastManualActive[sender] = Date.now();
         console.log(`Manual message detected for ${sender}. Pausing AI response.`);
         return; 
@@ -185,7 +184,6 @@ async function startBot() {
 
       if (sender.endsWith('@g.us')) return; 
 
-      // Check if the AI is currently muted for this specific client
       const lastManualTime = lastManualActive[sender] || 0;
       const timePassed = Date.now() - lastManualTime;
       
@@ -204,7 +202,6 @@ async function startBot() {
         const reply = await getAIResponse(text);
         await sock.sendPresenceUpdate('paused', sender);
         
-        // Track message ID to prevent self-muting
         const sentMsg = await sock.sendMessage(sender, { text: reply });
         if (sentMsg && sentMsg.key && sentMsg.key.id) {
           botMessageIds.add(sentMsg.key.id);
