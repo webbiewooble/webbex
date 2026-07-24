@@ -1,7 +1,13 @@
 const express = require('express');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } = require('@whiskeysockets/baileys');
+const { 
+  default: makeWASocket, 
+  useMultiFileAuthState, 
+  DisconnectReason, 
+  fetchLatestWaWebVersion, 
+  Browsers 
+} = require('@whiskeysockets/baileys');
 const pino = require('pino');
-const qrcode = require('qrcode'); // Re-added QR renderer for iPad screen scanning
+const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 const { getAIResponse } = require('./ai');
@@ -21,7 +27,6 @@ const lastManualActive = {};
 const botMessageIds = new Set(); 
 const AUTO_MUTE_DURATION = 15 * 60 * 1000; 
 
-// CRITICAL SAFETY GUARDS
 process.on('uncaughtException', (err) => {
   console.error('CRITICAL: Caught Uncaught Exception:', err.message);
 });
@@ -80,8 +85,16 @@ async function startBot() {
     version: waVersion, 
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: ['Ubuntu', 'Chrome', '20.0.04'],
     
+    // NATIVE OFFICIAL BROWSER GENERATOR
+    browser: Browsers.macOS('Desktop'),
+    
+    // CRITICAL FIX FOR CLOUD CONTAINERS:
+    // Stops WhatsApp from clogging the connection with historical messages during pairing
+    syncFullHistory: false,
+    fireInitQueries: false,
+    
+    // ACTIVE CONNECTION KEEP-ALIVES
     keepAliveIntervalMs: 15000,   
     connectTimeoutMs: 60000,      
     defaultQueryTimeoutMs: 0,     
@@ -121,7 +134,7 @@ async function startBot() {
     }
 
     if (qr && !sock.authState.creds.registered) {
-      rawQrData = qr; // Store raw QR payload for iPad camera scanning
+      rawQrData = qr; 
 
       if (process.env.PHONE_NUMBER && !pairingCodeRequested) {
         pairingCodeRequested = true;
@@ -135,7 +148,7 @@ async function startBot() {
           
           console.log(`\n=========================================\nYOUR WHATSAPP PAIRING CODE: ${code}\n=========================================\n`);
         } catch (err) {
-          console.error('Failed to request pairing code:', err);
+          console.error('Failed to request pairing code:', err.message);
           pairingCodeRequested = false; 
         }
       }
@@ -153,10 +166,10 @@ async function startBot() {
       const isRegisteredNow = state?.creds?.registered || false;
 
       if (reason === DisconnectReason.restartRequired || reason === 515) {
-        console.log('✓ Pairing code accepted by WhatsApp! Flushing credentials to disk before reconnecting...');
+        console.log('✓ Pairing accepted! Flushing credentials to disk before reconnecting...');
         setTimeout(() => {
           startBot();
-        }, 2000); 
+        }, 3000); // 3-second disk write buffer
         return;
       }
 
@@ -209,7 +222,7 @@ async function startBot() {
       
       if (timePassed < AUTO_MUTE_DURATION) {
         const minutesRemaining = Math.ceil((AUTO_MUTE_DURATION - timePassed) / 60000);
-        console.log(`AI PAUSED for ${sender} (${minutesRemaining} mins remaining) due to recent manual chat/call.`);
+        console.log(`AI PAUSED for ${sender} (${minutesRemaining} mins remaining).`);
         return; 
       }
 
@@ -233,13 +246,12 @@ async function startBot() {
   });
 }
 
-// 24/7 ANTI-IDLE HEARTBEAT
 setInterval(async () => {
   if (activeSock && connectionStatus === 'Connected') {
     try {
       await activeSock.sendPresenceUpdate('available');
     } catch (err) {
-      // transient background network variation
+      // background keepalive
     }
   }
 }, 30 * 1000); 
