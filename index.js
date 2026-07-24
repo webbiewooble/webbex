@@ -1,13 +1,6 @@
 const express = require('express');
-const { 
-  default: makeWASocket, 
-  useMultiFileAuthState, 
-  DisconnectReason, 
-  fetchLatestWaWebVersion, 
-  Browsers 
-} = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
-const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 const { getAIResponse } = require('./ai');
@@ -15,24 +8,23 @@ const { getAIResponse } = require('./ai');
 const app = express();
 const port = process.env.PORT || 8080;
 
-let globalSock = null; // SINGLETON REFERENCE
-let rawQrData = null;
 let pairingCode = null;
 let connectionStatus = 'Disconnected';
-let isConnecting = false;
+let isReconnecting = false;
+let pairingCodeRequested = false;
 
-// SMART AUTO-PAUSE MEMORY
+// Memory tracking
 const lastManualActive = {}; 
 const botMessageIds = new Set(); 
-const AUTO_MUTE_DURATION = 15 * 60 * 1000; 
+const AUTO_MUTE_DURATION = 15 * 60 * 1000; // 15 minutes
 
-// CRITICAL PROCESS GUARD
+// Process-level crash prevention
 process.on('uncaughtException', (err) => {
-  console.error('CRITICAL: Caught Uncaught Exception:', err.message);
+  console.error('Caught Uncaught Exception:', err.message);
 });
 
 process.on('unhandledRejection', (reason) => {
-  console.error('CRITICAL: Caught Unhandled Rejection:', reason);
+  console.error('Caught Unhandled Rejection:', reason);
 });
 
 function clearSessionDirectory() {
@@ -40,7 +32,7 @@ function clearSessionDirectory() {
   if (fs.existsSync(dir)) {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
-      console.log('✓ Cleared session directory.');
+      console.log('✓ Cleared corrupt/stale session directory.');
     } catch (err) {
       console.error('Failed to clear session directory:', err.message);
     }
@@ -48,49 +40,15 @@ function clearSessionDirectory() {
 }
 
 async function startBot() {
-  if (isConnecting) {
-    console.log('Connection attempt already in progress. Skipping duplicate execution...');
-    return;
-  }
-  isConnecting = true;
-
-  // 1. SESSION_DATA INJECTION: Restore directly from Base64 env variable if provided
-  if (process.env.SESSION_DATA) {
-    try {
-      const sessionDir = path.join(__dirname, 'auth_info_baileys');
-      if (!fs.existsSync(sessionDir)) {
-        fs.mkdirSync(sessionDir, { recursive: true });
-      }
-      const credsFilePath = path.join(sessionDir, 'creds.json');
-      const decodedCreds = Buffer.from(process.env.SESSION_DATA.trim(), 'base64').toString('utf-8');
-      fs.writeFileSync(credsFilePath, decodedCreds);
-      console.log('✓ Successfully restored WhatsApp session from SESSION_DATA variable!');
-    } catch (err) {
-      console.error('Error decoding SESSION_DATA variable:', err.message);
-    }
-  }
-
-  // Kill old socket listeners before launching a new one
-  if (globalSock) {
-    try {
-      console.log('Cleaning up old lingering socket connection...');
-      globalSock.ev.removeAllListeners();
-      globalSock.ws.close();
-      globalSock.end(undefined);
-    } catch (e) {
-      // Ignore teardown errors
-    }
-    globalSock = null;
-  }
-
   let authData = await useMultiFileAuthState('auth_info_baileys');
   let state = authData.state;
   let saveCreds = authData.saveCreds;
 
   const isRegistered = state?.creds?.registered || false;
 
-  if (!isRegistered && !process.env.SESSION_DATA) {
-    console.log('Starting in unregistered state. Purging stale pre-keys for clean slate...');
+  // Clear directory only if starting completely unregistered
+  if (!isRegistered) {
+    console.log('Bot starting in unregistered state. Purging stale pre-keys for clean slate...');
     clearSessionDirectory();
     
     const freshAuth = await useMultiFileAuthState('auth_info_baileys');
@@ -99,9 +57,8 @@ async function startBot() {
   }
 
   if (!process.env.PHONE_NUMBER) {
-    connectionStatus = 'Error: PHONE_NUMBER missing in Railway Variables!';
+    connectionStatus = 'Error: PHONE_NUMBER missing in Railway Dashboard!';
     console.error('CRITICAL ERROR: PHONE_NUMBER is missing in Railway variables!');
-    isConnecting = false;
     return;
   }
 
@@ -113,38 +70,16 @@ async function startBot() {
       console.log(`Using WhatsApp Web version: ${waVersion.join('.')}`);
     }
   } catch (err) {
-    console.warn('Could not fetch latest version, using fallback:', err.message);
-  }
-
-  // 2. PROXY AGENT ROUTING: Bypass Meta Datacenter IP Blocks if PROXY_URL is set
-  let customAgent = undefined;
-  if (process.env.PROXY_URL) {
-    try {
-      const { HttpsProxyAgent } = require('https-proxy-agent');
-      customAgent = new HttpsProxyAgent(process.env.PROXY_URL.trim());
-      console.log(`Routing WhatsApp WebSocket connection through Proxy: ${process.env.PROXY_URL}`);
-    } catch (proxyErr) {
-      console.error('Failed to initialize HttpsProxyAgent:', proxyErr.message);
-    }
+    console.warn('Could not fetch latest version, using stable fallback:', err.message);
   }
 
   const sock = makeWASocket({
     auth: state,
     version: waVersion, 
-    agent: customAgent, // Connect via proxy if provided
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: Browsers.macOS('Desktop'),
-    syncFullHistory: false,
-    fireInitQueries: false,
-    keepAliveIntervalMs: 15000,   
-    connectTimeoutMs: 60000,      
-    defaultQueryTimeoutMs: 0,     
-    retryRequestDelayMs: 5000,    
-    markOnlineOnConnect: true     
+    browser: ['Ubuntu', 'Chrome', '20.0.04']
   });
-
-  globalSock = sock; 
 
   sock.ev.on('creds.update', async () => {
     try {
@@ -175,20 +110,22 @@ async function startBot() {
       connectionStatus = 'Connecting...';
     }
 
-    if (qr && !sock.authState.creds.registered) {
-      rawQrData = qr; 
-      connectionStatus = 'Ready to Link (Scan QR Code)';
-      
-      if (process.env.PHONE_NUMBER && !pairingCode) {
-        try {
-          const cleanNumber = process.env.PHONE_NUMBER.replace(/[^0-9]/g, '');
-          console.log(`Requesting pairing code for: ${cleanNumber}`);
-          const code = await sock.requestPairingCode(cleanNumber);
-          pairingCode = code;
-          console.log(`\n=========================================\nYOUR WHATSAPP PAIRING CODE: ${code}\n=========================================\n`);
-        } catch (err) {
-          console.error('Failed to request pairing code:', err.message);
-        }
+    if (qr && !sock.authState.creds.registered && process.env.PHONE_NUMBER && !pairingCodeRequested) {
+      pairingCodeRequested = true;
+      connectionStatus = 'Generating Pairing Code...';
+      try {
+        const cleanNumber = process.env.PHONE_NUMBER.replace(/[^0-9]/g, '');
+        console.log(`Requesting pairing code for clean number: ${cleanNumber}`);
+        
+        const code = await sock.requestPairingCode(cleanNumber);
+        pairingCode = code;
+        connectionStatus = 'Pairing Code Ready';
+        
+        console.log(`\n=========================================\nYOUR WHATSAPP PAIRING CODE: ${code}\n=========================================\n`);
+      } catch (err) {
+        console.error('Failed to request pairing code:', err.message);
+        connectionStatus = 'Pairing Request Failed';
+        pairingCodeRequested = false; 
       }
     }
 
@@ -196,18 +133,16 @@ async function startBot() {
       const reason = lastDisconnect?.error?.output?.statusCode;
       console.log(`Connection closed with status code: ${reason || 'unknown'}`);
 
-      rawQrData = null;
       pairingCode = null; 
-      globalSock = null;
-      isConnecting = false;
+      pairingCodeRequested = false;
 
       const isRegisteredNow = state?.creds?.registered || false;
 
       if (reason === DisconnectReason.restartRequired || reason === 515) {
-        console.log('✓ Pairing accepted! Flushing credentials to disk before reconnecting...');
+        console.log('✓ Pairing accepted! Reconnecting immediately...');
         setTimeout(() => {
           startBot();
-        }, 3000); 
+        }, 2000);
         return;
       }
 
@@ -216,18 +151,21 @@ async function startBot() {
         clearSessionDirectory();
       }
 
-      connectionStatus = 'Disconnected (Reconnecting in 5s...)';
+      connectionStatus = 'Disconnected (Reconnecting...)';
 
-      setTimeout(() => {
-        startBot();
-      }, 5000);
+      if (!isReconnecting) {
+        isReconnecting = true;
+        setTimeout(() => {
+          isReconnecting = false;
+          startBot();
+        }, 5000);
+      }
 
     } else if (connection === 'open') {
       console.log('Connected to WhatsApp successfully!');
       connectionStatus = 'Connected';
-      rawQrData = null;
       pairingCode = null;
-      isConnecting = false;
+      pairingCodeRequested = false;
     }
   });
 
@@ -280,18 +218,7 @@ async function startBot() {
   });
 }
 
-// 24/7 Keep-Alive Ping every 30 seconds
-setInterval(async () => {
-  if (globalSock && connectionStatus === 'Connected') {
-    try {
-      await globalSock.sendPresenceUpdate('available');
-    } catch (err) {
-      // Ignore background variation
-    }
-  }
-}, 30 * 1000); 
-
-// Web Dashboard
+// Web Interface
 app.get('/', async (req, res) => {
   if (connectionStatus === 'Connected') {
     res.send(`
@@ -301,57 +228,32 @@ app.get('/', async (req, res) => {
           <div class="card">
             <h1>Webbiewooble AI Agent is Online!</h1>
             <p>Status: <strong>Connected</strong></p>
-            <p>The bot is active and replying 24/7 to personal messages on WhatsApp.</p>
+            <p>The bot is active and replying to personal messages on WhatsApp.</p>
           </div>
         </body>
       </html>
     `);
-  } else if (rawQrData || pairingCode) {
-    let qrImage = '';
-    if (rawQrData) {
-      try {
-        qrImage = await qrcode.toDataURL(rawQrData);
-      } catch (err) {
-        console.error('Error generating QR image:', err);
-      }
-    }
-
+  } else if (pairingCode) {
     res.send(`
       <html>
         <head>
-          <title>Link Your Bot - Webbiewooble</title>
+          <title>Pairing Code - Webbiewooble</title>
           <meta http-equiv="refresh" content="15">
           <style>
-            body { font-family: sans-serif; text-align: center; margin-top: 30px; background-color: #f0f2f5; }
-            .card { background: white; padding: 30px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 10px rgba(0,0,0,0.1); max-width: 480px; }
-            .code { font-size: 32px; font-weight: bold; letter-spacing: 4px; color: #128c7e; background-color: #e3f2fd; padding: 12px 20px; border-radius: 6px; margin: 15px 0; display: inline-block; font-family: monospace; }
-            img { border: 2px solid #128c7e; padding: 10px; border-radius: 8px; margin: 10px 0; width: 220px; height: 220px; }
-            h1 { color: #128c7e; margin-bottom: 5px; }
-            .method-box { background: #fafafa; border: 1px solid #e0e0e0; padding: 15px; border-radius: 8px; margin-top: 15px; }
+            body { font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #f0f2f5; }
+            .card { background: white; padding: 35px; border-radius: 8px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+            .code { font-size: 34px; font-weight: bold; letter-spacing: 4px; color: #128c7e; background-color: #e3f2fd; padding: 15px 25px; border-radius: 5px; margin: 20px 0; display: inline-block; font-family: monospace; }
+            h1 { color: #128c7e; }
           </style>
         </head>
         <body>
           <div class="card">
             <h1>Link Your Webbiewooble Bot</h1>
             <p>Status: <strong>${connectionStatus}</strong></p>
-            
-            ${qrImage ? `
-              <div class="method-box">
-                <h3 style="margin-top:0; color:#075e54;">METHOD 1: Scan QR Code (Fastest)</h3>
-                <p><small>Open WhatsApp on phone → <strong>Linked Devices</strong> → <strong>Link a Device</strong> → Point phone camera at this iPad screen:</small></p>
-                <img src="${qrImage}" alt="WhatsApp QR Code" />
-              </div>
-            ` : ''}
-
-            ${pairingCode ? `
-              <div class="method-box">
-                <h3 style="margin-top:0; color:#075e54;">METHOD 2: Pairing Code</h3>
-                <p><small>WhatsApp → Linked Devices → Link with phone number instead:</small></p>
-                <div class="code">${pairingCode}</div>
-              </div>
-            ` : ''}
-
-            <p><small style="color: #888;">This page auto-refreshes every 15 seconds.</small></p>
+            <p>Enter this code on your WhatsApp mobile app:</p>
+            <div class="code">${pairingCode}</div>
+            <p style="color: #666;"><small>To link, open WhatsApp on your phone:<br><strong>Settings</strong> → <strong>Linked Devices</strong> → <strong>Link a Device</strong> → <strong>Link with phone number instead</strong></small></p>
+            <p><small>This page auto-refreshes. Once successfully linked, the status changes to Online.</small></p>
           </div>
         </body>
       </html>
@@ -366,7 +268,7 @@ app.get('/', async (req, res) => {
             <p>Status: <span class="${connectionStatus.includes('Error') ? 'error-msg' : ''}"><strong>${connectionStatus}</strong></span></p>
             ${connectionStatus.includes('Error') ? 
               '<p>Please configure the <code>PHONE_NUMBER</code> variable inside your Railway Dashboard, then rebuild the service.</p>' : 
-              '<p>Generating secure QR code and Pairing code. Please wait a few seconds...</p>'
+              '<p>Requesting fresh pairing code. Please wait a few seconds...</p>'
             }
           </div>
         </body>
