@@ -12,13 +12,15 @@ let pairingCode = null;
 let connectionStatus = 'Disconnected';
 let isReconnecting = false;
 let pairingCodeRequested = false;
+let activeSock = null;
+let lastSocketActivity = Date.now(); // Watchdog activity tracker
 
-// Memory tracking
+// SMART AUTO-PAUSE MEMORY
 const lastManualActive = {}; 
 const botMessageIds = new Set(); 
-const AUTO_MUTE_DURATION = 15 * 60 * 1000; // 15 minutes
+const AUTO_MUTE_DURATION = 15 * 60 * 1000; 
 
-// Process-level crash prevention
+// CRITICAL PROCESS GUARD: Prevents crashes
 process.on('uncaughtException', (err) => {
   console.error('Caught Uncaught Exception:', err.message);
 });
@@ -46,7 +48,6 @@ async function startBot() {
 
   const isRegistered = state?.creds?.registered || false;
 
-  // Clear directory only if starting completely unregistered
   if (!isRegistered) {
     console.log('Bot starting in unregistered state. Purging stale pre-keys for clean slate...');
     clearSessionDirectory();
@@ -78,8 +79,15 @@ async function startBot() {
     version: waVersion, 
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: ['Ubuntu', 'Chrome', '20.0.04']
+    browser: ['Ubuntu', 'Chrome', '20.0.04'],
+    keepAliveIntervalMs: 15000,   // Active 15s keep-alive ping
+    connectTimeoutMs: 60000,      
+    defaultQueryTimeoutMs: 0,     
+    retryRequestDelayMs: 5000     
   });
+
+  activeSock = sock;
+  lastSocketActivity = Date.now();
 
   sock.ev.on('creds.update', async () => {
     try {
@@ -105,6 +113,7 @@ async function startBot() {
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
+    lastSocketActivity = Date.now(); // Update watchdog timer
 
     if (connection === 'connecting') {
       connectionStatus = 'Connecting...';
@@ -135,6 +144,7 @@ async function startBot() {
 
       pairingCode = null; 
       pairingCodeRequested = false;
+      activeSock = null;
 
       const isRegisteredNow = state?.creds?.registered || false;
 
@@ -171,6 +181,7 @@ async function startBot() {
 
   sock.ev.on('messages.upsert', async (m) => {
     try {
+      lastSocketActivity = Date.now(); // Refresh watchdog on message
       const msg = m.messages[0];
       if (!msg.message) return;
 
@@ -218,6 +229,32 @@ async function startBot() {
   });
 }
 
+// 1. WATCHDOG TIMER (Runs every 2 minutes):
+// Detects zombie sockets that silently dropped and force-heals the connection
+setInterval(() => {
+  if (connectionStatus === 'Connected') {
+    const inactiveTime = Date.now() - lastSocketActivity;
+    // If no socket activity or event in 4 minutes, force a self-healing reconnect
+    if (inactiveTime > 4 * 60 * 1000) {
+      console.warn('WATCHDOG: Silent connection drop detected. Force-healing connection...');
+      connectionStatus = 'Reconnecting (Watchdog)...';
+      if (activeSock) {
+        try { activeSock.end(undefined); } catch (e) {}
+      }
+      startBot();
+    } else if (activeSock) {
+      // Send background presence to keep socket warm
+      activeSock.sendPresenceUpdate('available').catch(() => {});
+    }
+  }
+}, 2 * 60 * 1000);
+
+// 2. SELF-PING CONTAINER HEARTBEAT (Runs every 5 minutes):
+// Keeps Railway container network 100% active
+setInterval(() => {
+  fetch(`http://localhost:${port}/`).catch(() => {});
+}, 5 * 60 * 1000);
+
 // Web Interface
 app.get('/', async (req, res) => {
   if (connectionStatus === 'Connected') {
@@ -227,8 +264,8 @@ app.get('/', async (req, res) => {
         <body>
           <div class="card">
             <h1>Webbiewooble AI Agent is Online!</h1>
-            <p>Status: <strong>Connected</strong></p>
-            <p>The bot is active and replying to personal messages on WhatsApp.</p>
+            <p>Status: <strong>Connected (Watchdog Active)</strong></p>
+            <p>The bot is active and replying 24/7 to personal messages on WhatsApp.</p>
           </div>
         </body>
       </html>
