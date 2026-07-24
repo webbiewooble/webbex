@@ -15,23 +15,23 @@ const { getAIResponse } = require('./ai');
 const app = express();
 const port = process.env.PORT || 8080;
 
+let globalSock = null; // SINGLETON REFERENCE: Guarantees only 1 socket runs in memory
 let rawQrData = null;
 let pairingCode = null;
 let connectionStatus = 'Disconnected';
-let isReconnecting = false;
-let pairingCodeRequested = false;
-let activeSock = null;
+let isConnecting = false;
 
 // SMART AUTO-PAUSE MEMORY
 const lastManualActive = {}; 
 const botMessageIds = new Set(); 
 const AUTO_MUTE_DURATION = 15 * 60 * 1000; 
 
+// CRITICAL PROCESS GUARD: Prevents crashes from network/API drops
 process.on('uncaughtException', (err) => {
   console.error('CRITICAL: Caught Uncaught Exception:', err.message);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   console.error('CRITICAL: Caught Unhandled Rejection:', reason);
 });
 
@@ -40,7 +40,7 @@ function clearSessionDirectory() {
   if (fs.existsSync(dir)) {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
-      console.log('✓ Cleared corrupt/stale session directory.');
+      console.log('✓ Cleared session directory.');
     } catch (err) {
       console.error('Failed to clear session directory:', err.message);
     }
@@ -48,14 +48,34 @@ function clearSessionDirectory() {
 }
 
 async function startBot() {
+  if (isConnecting) {
+    console.log('Connection attempt already in progress. Skipping duplicate execution...');
+    return;
+  }
+  isConnecting = true;
+
+  // GHOST SOCKET ERADICATION: Kill lingering old sockets before launching a new one!
+  if (globalSock) {
+    try {
+      console.log('Cleaning up old lingering socket connection...');
+      globalSock.ev.removeAllListeners();
+      globalSock.ws.close();
+      globalSock.end(undefined);
+    } catch (e) {
+      // Ignore teardown errors
+    }
+    globalSock = null;
+  }
+
   let authData = await useMultiFileAuthState('auth_info_baileys');
   let state = authData.state;
   let saveCreds = authData.saveCreds;
 
   const isRegistered = state?.creds?.registered || false;
 
+  // Clean startup slate if not registered
   if (!isRegistered) {
-    console.log('Bot starting in unregistered state. Purging stale pre-keys for clean slate...');
+    console.log('Starting in unregistered state. Purging stale pre-keys for clean slate...');
     clearSessionDirectory();
     
     const freshAuth = await useMultiFileAuthState('auth_info_baileys');
@@ -64,8 +84,9 @@ async function startBot() {
   }
 
   if (!process.env.PHONE_NUMBER) {
-    connectionStatus = 'Error: PHONE_NUMBER variable missing in Railway Dashboard!';
+    connectionStatus = 'Error: PHONE_NUMBER missing in Railway Variables!';
     console.error('CRITICAL ERROR: PHONE_NUMBER is missing in Railway variables!');
+    isConnecting = false;
     return;
   }
 
@@ -86,11 +107,10 @@ async function startBot() {
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
     
-    // NATIVE OFFICIAL BROWSER GENERATOR
+    // NATIVE DESKTOP HANDSHAKE
     browser: Browsers.macOS('Desktop'),
     
-    // CRITICAL FIX FOR CLOUD CONTAINERS:
-    // Stops WhatsApp from clogging the connection with historical messages during pairing
+    // LIGHTWEIGHT CLOUD CONNECTION: Stops WhatsApp from choking socket with old messages
     syncFullHistory: false,
     fireInitQueries: false,
     
@@ -102,7 +122,7 @@ async function startBot() {
     markOnlineOnConnect: true     
   });
 
-  activeSock = sock; 
+  globalSock = sock; // Save to global singleton
 
   sock.ev.on('creds.update', async () => {
     try {
@@ -135,21 +155,17 @@ async function startBot() {
 
     if (qr && !sock.authState.creds.registered) {
       rawQrData = qr; 
-
-      if (process.env.PHONE_NUMBER && !pairingCodeRequested) {
-        pairingCodeRequested = true;
-        connectionStatus = 'Ready to Link';
+      connectionStatus = 'Ready to Link (Scan QR Code)';
+      
+      if (process.env.PHONE_NUMBER && !pairingCode) {
         try {
           const cleanNumber = process.env.PHONE_NUMBER.replace(/[^0-9]/g, '');
           console.log(`Requesting pairing code for: ${cleanNumber}`);
-          
           const code = await sock.requestPairingCode(cleanNumber);
           pairingCode = code;
-          
           console.log(`\n=========================================\nYOUR WHATSAPP PAIRING CODE: ${code}\n=========================================\n`);
         } catch (err) {
           console.error('Failed to request pairing code:', err.message);
-          pairingCodeRequested = false; 
         }
       }
     }
@@ -160,16 +176,17 @@ async function startBot() {
 
       rawQrData = null;
       pairingCode = null; 
-      pairingCodeRequested = false;
-      activeSock = null;
+      globalSock = null;
+      isConnecting = false;
 
       const isRegisteredNow = state?.creds?.registered || false;
 
+      // PAIRING SUCCESS (515) -> DISK FLUSH BUFFER
       if (reason === DisconnectReason.restartRequired || reason === 515) {
         console.log('✓ Pairing accepted! Flushing credentials to disk before reconnecting...');
         setTimeout(() => {
           startBot();
-        }, 3000); // 3-second disk write buffer
+        }, 3000); // 3-second buffer ensures disk synchronization
         return;
       }
 
@@ -178,22 +195,18 @@ async function startBot() {
         clearSessionDirectory();
       }
 
-      connectionStatus = 'Disconnected (Reconnecting...)';
+      connectionStatus = 'Disconnected (Reconnecting in 5s...)';
 
-      if (!isReconnecting) {
-        isReconnecting = true;
-        setTimeout(() => {
-          isReconnecting = false;
-          startBot();
-        }, 5000);
-      }
+      setTimeout(() => {
+        startBot();
+      }, 5000);
 
     } else if (connection === 'open') {
       console.log('Connected to WhatsApp successfully!');
       connectionStatus = 'Connected';
       rawQrData = null;
       pairingCode = null;
-      pairingCodeRequested = false;
+      isConnecting = false;
     }
   });
 
@@ -246,12 +259,13 @@ async function startBot() {
   });
 }
 
+// 24/7 Keep-Alive Ping every 30 seconds
 setInterval(async () => {
-  if (activeSock && connectionStatus === 'Connected') {
+  if (globalSock && connectionStatus === 'Connected') {
     try {
-      await activeSock.sendPresenceUpdate('available');
+      await globalSock.sendPresenceUpdate('available');
     } catch (err) {
-      // background keepalive
+      // Ignore background variation
     }
   }
 }, 30 * 1000); 
