@@ -108,7 +108,7 @@ async function callOpenRouter(prompt) {
   return data.choices[0].message.content;
 }
 
-// Main AI Handler with dynamic case-insensitive primary configuration
+// Main AI Handler
 async function getAIResponse(prompt) {
   const primary = (process.env.PRIMARY_AI || 'groq').toLowerCase();
   const order = [primary, 'groq', 'gemini', 'openrouter'].filter((v, i, a) => a.indexOf(v) === i);
