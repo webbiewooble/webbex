@@ -15,7 +15,7 @@ const { getAIResponse } = require('./ai');
 const app = express();
 const port = process.env.PORT || 8080;
 
-let globalSock = null; // SINGLETON REFERENCE: Guarantees only 1 socket runs in memory
+let globalSock = null; // SINGLETON REFERENCE
 let rawQrData = null;
 let pairingCode = null;
 let connectionStatus = 'Disconnected';
@@ -26,7 +26,7 @@ const lastManualActive = {};
 const botMessageIds = new Set(); 
 const AUTO_MUTE_DURATION = 15 * 60 * 1000; 
 
-// CRITICAL PROCESS GUARD: Prevents crashes from network/API drops
+// CRITICAL PROCESS GUARD
 process.on('uncaughtException', (err) => {
   console.error('CRITICAL: Caught Uncaught Exception:', err.message);
 });
@@ -54,7 +54,23 @@ async function startBot() {
   }
   isConnecting = true;
 
-  // GHOST SOCKET ERADICATION: Kill lingering old sockets before launching a new one!
+  // 1. SESSION_DATA INJECTION: Restore directly from Base64 env variable if provided
+  if (process.env.SESSION_DATA) {
+    try {
+      const sessionDir = path.join(__dirname, 'auth_info_baileys');
+      if (!fs.existsSync(sessionDir)) {
+        fs.mkdirSync(sessionDir, { recursive: true });
+      }
+      const credsFilePath = path.join(sessionDir, 'creds.json');
+      const decodedCreds = Buffer.from(process.env.SESSION_DATA.trim(), 'base64').toString('utf-8');
+      fs.writeFileSync(credsFilePath, decodedCreds);
+      console.log('✓ Successfully restored WhatsApp session from SESSION_DATA variable!');
+    } catch (err) {
+      console.error('Error decoding SESSION_DATA variable:', err.message);
+    }
+  }
+
+  // Kill old socket listeners before launching a new one
   if (globalSock) {
     try {
       console.log('Cleaning up old lingering socket connection...');
@@ -73,8 +89,7 @@ async function startBot() {
 
   const isRegistered = state?.creds?.registered || false;
 
-  // Clean startup slate if not registered
-  if (!isRegistered) {
+  if (!isRegistered && !process.env.SESSION_DATA) {
     console.log('Starting in unregistered state. Purging stale pre-keys for clean slate...');
     clearSessionDirectory();
     
@@ -101,20 +116,27 @@ async function startBot() {
     console.warn('Could not fetch latest version, using fallback:', err.message);
   }
 
+  // 2. PROXY AGENT ROUTING: Bypass Meta Datacenter IP Blocks if PROXY_URL is set
+  let customAgent = undefined;
+  if (process.env.PROXY_URL) {
+    try {
+      const { HttpsProxyAgent } = require('https-proxy-agent');
+      customAgent = new HttpsProxyAgent(process.env.PROXY_URL.trim());
+      console.log(`Routing WhatsApp WebSocket connection through Proxy: ${process.env.PROXY_URL}`);
+    } catch (proxyErr) {
+      console.error('Failed to initialize HttpsProxyAgent:', proxyErr.message);
+    }
+  }
+
   const sock = makeWASocket({
     auth: state,
     version: waVersion, 
+    agent: customAgent, // Connect via proxy if provided
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    
-    // NATIVE DESKTOP HANDSHAKE
     browser: Browsers.macOS('Desktop'),
-    
-    // LIGHTWEIGHT CLOUD CONNECTION: Stops WhatsApp from choking socket with old messages
     syncFullHistory: false,
     fireInitQueries: false,
-    
-    // ACTIVE CONNECTION KEEP-ALIVES
     keepAliveIntervalMs: 15000,   
     connectTimeoutMs: 60000,      
     defaultQueryTimeoutMs: 0,     
@@ -122,7 +144,7 @@ async function startBot() {
     markOnlineOnConnect: true     
   });
 
-  globalSock = sock; // Save to global singleton
+  globalSock = sock; 
 
   sock.ev.on('creds.update', async () => {
     try {
@@ -181,12 +203,11 @@ async function startBot() {
 
       const isRegisteredNow = state?.creds?.registered || false;
 
-      // PAIRING SUCCESS (515) -> DISK FLUSH BUFFER
       if (reason === DisconnectReason.restartRequired || reason === 515) {
         console.log('✓ Pairing accepted! Flushing credentials to disk before reconnecting...');
         setTimeout(() => {
           startBot();
-        }, 3000); // 3-second buffer ensures disk synchronization
+        }, 3000); 
         return;
       }
 
